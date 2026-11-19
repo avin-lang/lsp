@@ -1,0 +1,147 @@
+module tests
+
+// Positions: characters counted in UTF-16 code units or UTF-8 bytes against a document's byte
+// offsets, the three line terminators, and changes made to a document.
+import dev.avinlang.lsp.{
+  Position, PositionEncoding, Range, TextDocument, TextDocumentContentChangeEvent, negotiate
+}
+
+doc(text: string) -> TextDocument = TextDocument("file:///t", "toy", 1, text)
+
+pos(line: int, character: int) -> Position = Position(line, character)
+
+range(l1: int, c1: int, l2: int, c2: int) -> Range = Range(Position(l1, c1), Position(l2, c2))
+
+// `text` with `range`'s text replaced by `by`, in UTF-16.
+edited(text: string, r: Range, by: string, encoding: PositionEncoding = PositionEncoding.Utf16) -> string =
+  doc(text).applying(TextDocumentContentChangeEvent(Some(r), by), 2, encoding).text
+
+@test("a character beyond U+FFFF counts two UTF-16 units and four UTF-8 bytes")
+surrogates()
+  val d = doc("a😀b")
+  assertEq(d.offsetAt(pos(0, 0)), 0)
+  assertEq(d.offsetAt(pos(0, 1)), 1)
+  assertEq(d.offsetAt(pos(0, 3)), 5)
+  assertEq(d.offsetAt(pos(0, 4)), 6)
+  assertEq(d.positionAt(5), pos(0, 3))
+  assertEq(d.positionAt(6), pos(0, 4))
+  assertEq(d.offsetAt(pos(0, 5), PositionEncoding.Utf8), 5)
+  assertEq(d.positionAt(5, PositionEncoding.Utf8), pos(0, 5))
+
+@test("a position between the halves of a surrogate pair is the character's start")
+insidePair()
+  val d = doc("😀😀")
+  assertEq(d.offsetAt(pos(0, 1)), 0)
+  assertEq(d.offsetAt(pos(0, 2)), 4)
+  assertEq(d.offsetAt(pos(0, 3)), 4)
+  assertEq(d.positionAt(2), pos(0, 0))
+  assertEq(d.positionAt(6), pos(0, 2))
+  assertEq(d.offsetAt(pos(0, 2), PositionEncoding.Utf8), 0)
+
+@test("characters of two and three bytes count one UTF-16 unit each")
+multibyte()
+  val d = doc("é€x")
+  assertEq(d.offsetAt(pos(0, 1)), 2)
+  assertEq(d.offsetAt(pos(0, 2)), 5)
+  assertEq(d.positionAt(5), pos(0, 2))
+  assertEq(d.offsetAt(pos(0, 5), PositionEncoding.Utf8), 5)
+  assertEq(d.positionAt(6), pos(0, 3))
+
+@test("lines end at \\n, \\r\\n and \\r, and a position past a line's end is its end")
+lineEnds()
+  val d = doc("ab\ncd\r\nef\rgh")
+  assertEq(d.lineCount, 4)
+  assertEq(d.lineText(0), "ab")
+  assertEq(d.lineText(1), "cd")
+  assertEq(d.lineText(2), "ef")
+  assertEq(d.lineText(3), "gh")
+  assertEq(d.offsetAt(pos(1, 0)), 3)
+  assertEq(d.offsetAt(pos(1, 9)), 5)
+  assertEq(d.offsetAt(pos(2, 0)), 7)
+  assertEq(d.offsetAt(pos(3, 1)), 11)
+  assertEq(d.positionAt(6), pos(1, 2))
+  assertEq(d.positionAt(5), pos(1, 2))
+  assertEq(d.positionAt(9), pos(2, 2))
+  assertEq(doc("a\n").lineCount, 2)
+  assertEq(doc("a\r\n\r\n").lineCount, 3)
+
+@test("a line past the last is the end of the text, and an offset past the end is clamped")
+pastTheEnd()
+  val d = doc("ab\ncd")
+  assertEq(d.offsetAt(pos(2, 0)), 5)
+  assertEq(d.offsetAt(pos(99, 99)), 5)
+  assertEq(d.positionAt(99), pos(1, 2))
+  assertEq(d.positionAt(-3), pos(0, 0))
+  assertEq(d.offsetAt(pos(-1, 0)), 0)
+  assertEq(d.lineText(5), "")
+
+@test("an empty document has one empty line")
+emptyDocument()
+  val d = doc("")
+  assertEq(d.lineCount, 1)
+  assertEq(d.offsetAt(pos(0, 0)), 0)
+  assertEq(d.offsetAt(pos(3, 7)), 0)
+  assertEq(d.positionAt(0), pos(0, 0))
+  assertEq(d.fullRange(), range(0, 0, 0, 0))
+  assertEq(edited("", range(0, 0, 0, 0), "hi"), "hi")
+  assertEq(edited("", range(4, 2, 9, 9), "hi"), "hi")
+
+@test("an insertion, a deletion and a replacement")
+edits()
+  assertEq(edited("hello world", range(0, 5, 0, 5), ","), "hello, world")
+  assertEq(edited("hello world", range(0, 5, 0, 11), ""), "hello")
+  assertEq(edited("hello world", range(0, 0, 0, 5), "goodbye"), "goodbye world")
+  assertEq(edited("hello", range(0, 0, 0, 5), ""), "")
+
+@test("edits at a line's end, joining lines and splitting one")
+lineEndEdits()
+  assertEq(edited("ab\ncd", range(0, 2, 0, 2), "!"), "ab!\ncd")
+  assertEq(edited("ab\ncd", range(0, 2, 1, 0), ""), "abcd")
+  assertEq(edited("abcd", range(0, 2, 0, 2), "\n"), "ab\ncd")
+  assertEq(edited("ab\ncd\n", range(1, 2, 2, 0), ""), "ab\ncd")
+  assertEq(edited("ab\ncd", range(1, 2, 1, 2), "\n"), "ab\ncd\n")
+
+@test("edits across \\r\\n: a position past the line's text stops before the terminator")
+crlfEdits()
+  assertEq(edited("ab\r\ncd", range(0, 2, 1, 0), ""), "abcd")
+  assertEq(edited("ab\r\ncd", range(0, 9, 0, 9), "!"), "ab!\r\ncd")
+  assertEq(edited("ab\r\ncd", range(1, 0, 1, 0), "x"), "ab\r\nxcd")
+  assertEq(edited("ab\rcd", range(0, 2, 1, 0), "\n"), "ab\ncd")
+  assertEq(edited("a\r\n\r\nb", range(1, 0, 2, 0), ""), "a\r\nb")
+
+@test("an edit past the end stops at the end, and one reversed replaces nothing")
+editPastTheEnd()
+  assertEq(edited("abc", range(0, 1, 5, 0), "X"), "aX")
+  assertEq(edited("abc", range(7, 0, 9, 0), "!"), "abc!")
+  assertEq(edited("abc", range(0, 99, 0, 99), "!"), "abc!")
+  assertEq(edited("abc", range(0, 2, 0, 1), "X"), "abXc")
+
+@test("edits beside and over a surrogate pair, in either encoding")
+emojiEdits()
+  assertEq(edited("a😀b", range(0, 1, 0, 3), ""), "ab")
+  assertEq(edited("a😀b", range(0, 3, 0, 3), "!"), "a😀!b")
+  assertEq(edited("a😀b", range(0, 2, 0, 3), ""), "ab")
+  assertEq(edited("a😀b", range(0, 1, 0, 5), "", PositionEncoding.Utf8), "ab")
+  assertEq(edited("😀\n😀", range(1, 2, 1, 2), "x"), "😀\n😀x")
+
+@test("a change with no range replaces the whole text, and the version is the change's")
+fullChange()
+  val d = doc("old").applying(TextDocumentContentChangeEvent(None, "new text"), 7)
+  assertEq(d.text, "new text")
+  assertEq(d.version, 7)
+  assertEq(d.uri, "file:///t")
+
+@test("the text of a range, and the whole document's range")
+textIn()
+  val d = doc("ab😀\ncd")
+  assertEq(d.textIn(range(0, 1, 1, 1)), "b😀\nc")
+  assertEq(d.fullRange(), range(0, 0, 1, 2))
+  assertEq(doc("x\n").fullRange(), range(0, 0, 1, 0))
+
+@test("UTF-8 is chosen where a client offers it, and UTF-16 otherwise")
+negotiated()
+  assertEq(negotiate(["utf-16", "utf-8"]), PositionEncoding.Utf8)
+  assertEq(negotiate(["utf-32", "utf-16"]), PositionEncoding.Utf16)
+  assertEq(negotiate([]), PositionEncoding.Utf16)
+  assertEq(PositionEncoding.Utf8.name, "utf-8")
+  assertEq(PositionEncoding.Utf16.name, "utf-16")

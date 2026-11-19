@@ -1,0 +1,5 @@
+package { name = "words", version = "0.0.1", description = "A language server for plain words, built on the lsp package", avin = "0.0.34" }
+
+dependencies {
+  lsp { path = "../.." }
+}

@@ -1,0 +1,241 @@
+module tests
+
+// What the tests share: a reader that gives its input in the pieces a test chooses, a server
+// running on a thread of its own and connected to a client over a Unix domain socket, and a toy
+// server that registers a handler of every kind.
+import avin.fs
+import avin.io.{IoError, Reader}
+import avin.net.{StreamWriter, UnixListener, UnixStream}
+import avin.threads.{Channel, Thread, sleep, spawn}
+import avin.time.{millis, seconds}
+import dev.avinlang.json.{Json, JsonDecoder, JsonEncoder}
+
+import dev.avinlang.lsp.{
+  Client, CompletionItem, CompletionItemKind, CompletionList, Context, Diagnostic, DiagnosticSeverity,
+  DidOpenTextDocumentParams, DocumentSymbol, Hover, Location, MarkupContent, Message, Position, PositionEncoding, Range,
+  RenameParams, RequestFailed, ResponseError, SemanticToken, SemanticTokens, SemanticTokensLegend, Server, SymbolKind,
+  TextDocument, TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams, TextEdit, WorkspaceEdit,
+  semanticTokens
+}
+
+// A source that gives `chunks` one read at a time, each cut to the most a read asks for, then ends.
+class ChunkReader(private var chunks: Vector[Array[byte]]): Reader
+  override read(max: int) -> Result[Array[byte], IoError]
+    if chunks.isEmpty then return Ok(Array.empty[byte]())
+    val first = chunks(0)
+    if first.length <= max
+      chunks = chunks.drop(1)
+      return Ok(first)
+    chunks = [first.slice(max, first.length)] ++ chunks.drop(1)
+    Ok(first.slice(0, max))
+
+bytesOf(text: string) -> Array[byte] = text.utf8
+
+// A reader of `pieces`, each a read of its own.
+pieces(texts: string*) -> ChunkReader = ChunkReader(texts.toVector.map(t -> t.utf8))
+
+// A server and the client connected to it.
+class Running(
+    val client: Client,
+    private val output: StreamWriter,
+    private val thread: Thread[int],
+    private val dir: string
+)
+  // Closes the client's side of the connection, so the server's input ends.
+  hangUp() = _ = output.close()
+
+  // The status the server ended with, once it has ended, and the socket's directory removed.
+  ended() -> int
+    val code = thread.join()
+    _ = fs.removeDirAll(dir)
+    code
+
+// The server `make` makes, serving on a thread of its own over a Unix domain socket, and a client of
+// it whose reads give up after ten seconds, so a server that never answers fails a test rather than
+// holding it.
+connected(make: @sendable () -> Server) -> Running
+  val dir = fs.createTempDir("lsp-").ok.get
+  val socket = dir + "/s"
+  val listener = UnixListener.bind(socket).ok.get
+  val thread = spawn(() ->
+    val (input, output) = UnixStream.connect(socket).ok.get.split()
+    val code = make().serve(input, output)
+    _ = output.close()
+    _ = input.close()
+    code)
+  val conn = listener.accept().ok.get
+  conn.setTimeout(seconds(10)).ok.get
+  val (input, output) = conn.split()
+  Running(Client(input, output), output, thread, dir)
+
+// `connected`, with the client's session begun: `initialize` answered and `initialized` sent.
+started(make: @sendable () -> Server, capabilities: Json = Json.obj()) -> Running
+  val r = connected(make)
+  r.client.initialize(capabilities).get
+  r
+
+// A server with no handler registered.
+bare() -> Server = Server("bare")
+
+data Echo(text: string) derives JsonEncoder, JsonDecoder
+
+// Where a document's `x` characters are: each is a warning, and the first word is a symbol.
+toyDiagnostics(doc: TextDocument, encoding: PositionEncoding) -> Vector[Diagnostic]
+  val found = Vector.newBuilder[Diagnostic]()
+  for line in 0 ..< doc.lineCount
+    val text = doc.lineText(line)
+    var at = 0
+    while at < text.byteLength
+      val c = text.charAt(at)
+      if c == 'x'
+        val from = doc.positionAt(doc.offsetAt(Position(line, 0), encoding) + at, encoding)
+        val to = Position(from.line, from.character + 1)
+        found.addOne(Diagnostic(Range(from, to), "an x", Some(DiagnosticSeverity.Warning), source = Some("toy")))
+      at += c.toString().byteLength
+  found.result()
+
+// The word around `p` in `doc`: letters only.
+wordAt(doc: TextDocument, p: Position, encoding: PositionEncoding) -> Option[(string, Range)]
+  val text = doc.text
+  val at = doc.offsetAt(p, encoding)
+  var from = at
+  while from > 0 && isLetter(text.charAt(from - 1)) do from -= 1
+  var until = at
+  while until < text.byteLength && isLetter(text.charAt(until)) do until += 1
+  if from == until then None else Some(
+    (text.slice(from, until), Range(doc.positionAt(from, encoding), doc.positionAt(until, encoding)))
+  )
+
+isLetter(c: char) -> bool = 'a' <= c <= 'z' || 'A' <= c <= 'Z'
+
+// Every place `word` occurs in `doc` as a whole word.
+occurrences(doc: TextDocument, word: string, encoding: PositionEncoding) -> Vector[Range]
+  val found = Vector.newBuilder[Range]()
+  var at = doc.text.indexOf(word)
+  while at >= 0
+    val until = at + word.byteLength
+    val before = at == 0 || !isLetter(doc.text.charAt(at - 1))
+    val after = until >= doc.text.byteLength || !isLetter(doc.text.charAt(until))
+    if before && after then found.addOne(Range(doc.positionAt(at, encoding), doc.positionAt(until, encoding)))
+    at = doc.text.indexOf(word, until)
+  found.result()
+
+// A server that answers every kind of request from the text of the document it names: a hover
+// shows the word under the cursor, a definition is the word's first occurrence and its references
+// all of them, completion offers the document's words, the symbols are the lines' first words,
+// formatting trims trailing spaces, a rename replaces every occurrence, and the semantic tokens are
+// the words, each of type 0. `x` characters are warnings.
+toy() -> Server = Server("toy", "1.0")
+  .onDiagnostics((ctx, doc) -> toyDiagnostics(doc, ctx.encoding))
+  .onHover((ctx, p) -> Ok(ctx.document(p.textDocument.uri).flatMap(d -> wordAt(d, p.position, ctx.encoding)).map(w ->
+    Hover(MarkupContent.markdown(s"**${w.0}**"), Some(w.1)))))
+  .onDefinition((ctx, p) -> Ok(definitionOf(ctx, p.textDocument.uri, p.position)))
+  .onReferences((ctx, p) -> Ok(referencesOf(ctx, p.textDocument.uri, p.position, p.context.includeDeclaration)))
+  .onCompletion((ctx, p) -> Ok(CompletionList(false, wordsOf(ctx, p.textDocument.uri).map(w ->
+    CompletionItem(w, kind = Some(CompletionItemKind.Text))))), triggerCharacters = ["."])
+  .onDocumentSymbols((ctx, p) -> Ok(symbolsOf(ctx, p.textDocument.uri)))
+  .onFormatting((ctx, p) -> Ok(trimmed(ctx, p.textDocument.uri)))
+  .onRename((ctx, p) -> renamed(ctx, p))
+  .onSemanticTokens(
+    SemanticTokensLegend(["variable"], ["declaration"]),
+    (ctx, p) -> Ok(tokensOf(ctx, p.textDocument.uri))
+  )
+  .onRequest("toy/echo", (ctx: Context, p: Echo) -> Ok[Echo, ResponseError](p))
+
+// Every occurrence of the word at `p` in the document `uri`, as locations; none where there is no
+// such document or no word there.
+locationsOf(ctx: Context, uri: string, p: Position) -> Vector[Location] = ctx.document(uri) match
+  None -> []
+  Some(doc) -> wordAt(doc, p, ctx.encoding) match
+    None -> []
+    Some((word, _)) -> occurrences(doc, word, ctx.encoding).map(r -> Location(uri, r))
+
+// The toy server with requests that wait: `toy/wait` answers the next number sent on `gate`, and
+// `toy/spin` turns until its request is cancelled, then sends 1 on `seen` and answers 0.
+gated(gate: Channel[int], seen: Channel[int] = Channel[int]()) -> Server = toy()
+  .onRequest("toy/wait", (ctx: Context, p: Json) -> Ok[int, ResponseError](gate.receive().getOrElse(-1)))
+  .onRequest("toy/spin", (ctx: Context, p: Json) -> spin(ctx, seen))
+
+spin(ctx: Context, seen: Channel[int]) -> Result[int, ResponseError]
+  while !ctx.isCancelled do sleep(millis(1))
+  seen.send(1)
+  Ok(0)
+
+definitionOf(ctx: Context, uri: string, p: Position) -> Vector[Location] = locationsOf(ctx, uri, p).take(1)
+
+referencesOf(ctx: Context, uri: string, p: Position, withDeclaration: bool) -> Vector[Location]
+  val all = locationsOf(ctx, uri, p)
+  if withDeclaration then all else all.drop(1)
+
+wordsOf(ctx: Context, uri: string) -> Vector[string] = ctx.document(uri) match
+  None -> []
+  Some(doc) -> doc.text.split(" ").flatMap(w -> w.split("\n")).filter(
+    w -> w.nonEmpty && w.forall(isLetter)
+  ).distinct.sorted
+
+symbolsOf(ctx: Context, uri: string) -> Vector[DocumentSymbol] = ctx.document(uri) match
+  None -> []
+  Some(doc) -> symbolsIn(doc)
+
+symbolsIn(doc: TextDocument) -> Vector[DocumentSymbol]
+  val found = Vector.newBuilder[DocumentSymbol]()
+  for line in 0 ..< doc.lineCount
+    val text = doc.lineText(line)
+    val word = text.takeWhile(isLetter)
+    if word.nonEmpty
+      val r = Range(Position(line, 0), Position(line, word.charCount))
+      found.addOne(DocumentSymbol(word, SymbolKind.Function, r, r, detail = Some(s"line $line")))
+  found.result()
+
+trimmed(ctx: Context, uri: string) -> Vector[TextEdit] = ctx.document(uri) match
+  None -> []
+  Some(doc) -> trimmedIn(doc, ctx.encoding)
+
+trimmedIn(doc: TextDocument, encoding: PositionEncoding) -> Vector[TextEdit]
+  val edits = Vector.newBuilder[TextEdit]()
+  for line in 0 ..< doc.lineCount
+    val text = doc.lineText(line)
+    val kept = text.stripTrailing
+    if kept.byteLength < text.byteLength
+      val from = doc.positionAt(doc.offsetAt(Position(line, 0)) + kept.byteLength, encoding)
+      val to = doc.positionAt(doc.offsetAt(Position(line, 0)) + text.byteLength, encoding)
+      edits.addOne(TextEdit(Range(from, to), ""))
+  edits.result()
+
+renamed(ctx: Context, p: RenameParams) -> Result[Option[WorkspaceEdit], ResponseError]
+  if p.newName.isEmpty || !p.newName.forall(isLetter) then return Err(
+    ResponseError(RequestFailed, s"'${p.newName}' is not a word")
+  )
+  val uri = p.textDocument.uri
+  val edits = locationsOf(ctx, uri, p.position).map(l -> TextEdit(l.range, p.newName))
+  Ok(if edits.isEmpty then None else Some(WorkspaceEdit(TreeMap((uri, edits)))))
+
+tokensOf(ctx: Context, uri: string) -> SemanticTokens = ctx.document(uri) match
+  None -> SemanticTokens([])
+  Some(doc) -> tokensIn(doc)
+
+tokensIn(doc: TextDocument) -> SemanticTokens
+  val tokens = Vector.newBuilder[SemanticToken]()
+  for line in 0 ..< doc.lineCount
+    val text = doc.lineText(line)
+    var at = 0
+    while at < text.byteLength
+      if isLetter(text.charAt(at))
+        var until = at
+        while until < text.byteLength && isLetter(text.charAt(until)) do until += 1
+        tokens.addOne(SemanticToken(line, at, until - at, 0, if at == 0 then 1 else 0))
+        at = until
+      else
+        at += text.charAt(at).toString().byteLength
+  semanticTokens(tokens.result())
+
+// Opens `text` as the document `uri`.
+open(c: Client, uri: string, text: string, version: int = 1) =
+  c.notify("textDocument/didOpen", DidOpenTextDocumentParams(TextDocumentItem(uri, "toy", version, text)))
+
+// The params naming `uri` and a place in it.
+at(uri: string, line: int, character: int) -> TextDocumentPositionParams =
+  TextDocumentPositionParams(TextDocumentIdentifier(uri), Position(line, character))
+
+// The code of a response's error, or 0 for a response with none.
+codeOf(m: Option[Message]) -> int = m.flatMap(r -> r.error).map(e -> e.code).getOrElse(0)

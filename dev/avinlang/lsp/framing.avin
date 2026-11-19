@@ -1,0 +1,149 @@
+module dev.avinlang.lsp
+
+// The base protocol's framing: each message is a header block of `Name: value` lines, each ended by
+// `\r\n`, a blank line, and a body of exactly as many bytes as its `Content-Length` header says.
+import avin.io.Reader
+
+// The most a header block may hold before it is taken as garbage rather than a header.
+val maxHeaderBytes: int = 8192
+
+// The largest body read unless a reader is given another limit: 64 MiB.
+val defaultMaxMessageBytes: int = 67108864
+
+// What stops a stream of messages from being read. Past any of these there is no telling where the
+// next message starts, so a server stops reading.
+data FramingError
+  // A header block with no `Content-Length`.
+  MissingLength
+  // A `Content-Length` that is not a count of bytes: its text is `value`.
+  BadLength(value: string)
+  // A body longer than the reader takes.
+  TooLarge(length: long, limit: int)
+  // A header line with no `:`, or a header block longer than `maxHeaderBytes`.
+  BadHeader(line: string)
+  // The input ended inside a message, its header or its body.
+  Truncated
+  // The source failed to read.
+  Unreadable(reason: string)
+
+impl FramingError
+  message -> string = self match
+    MissingLength -> "a message with no Content-Length header"
+    BadLength(v) -> s"'$v' is not a Content-Length"
+    TooLarge(n, limit) -> s"a message of $n bytes, past the limit of $limit"
+    BadHeader(line) -> s"'$line' is not a header"
+    Truncated -> "the input ended inside a message"
+    Unreadable(m) -> s"the input could not be read: $m"
+
+impl Display for FramingError
+  display(out: Writer, spec: FormatSpec) = out.writeField(message, spec)
+
+// The message `body` framed: its `Content-Length` header, counting the body's UTF-8 bytes, a blank
+// line and the body.
+frame(body: string) -> string = s"Content-Length: ${body.byteLength}\r\n\r\n$body"
+
+// Reads framed messages off `source` one at a time, however the source cuts them: a header split
+// across reads, several messages in one read, a body arriving a piece at a time. Header names are
+// matched without regard to case, and every header but `Content-Length` is read and passed over,
+// `Content-Type` among them.
+class MessageReader(private val source: Reader, val maxMessageBytes: int = defaultMaxMessageBytes)
+  // Bytes read and not yet taken, from `start` on.
+  private var pending: Array[byte] = Array.empty[byte]()
+  private var start = 0
+  private var ended = false
+
+  // The next message's body as its bytes, `None` where the input ended cleanly between two messages.
+  nextBytes() -> Result[Option[Array[byte]], FramingError]
+    var scanned = 0
+    loop
+      val head = headerEnd(scanned)
+      if head >= 0
+        val length = contentLength(headerText(head))?
+        start += head + 4
+        return readBody(length).map(b -> Some(b))
+      if available() > maxHeaderBytes then return Err(BadHeader(headerText(maxHeaderBytes).take(40)))
+      scanned = if available() > 3 then available() - 3 else 0
+      if !fill()?
+        return if available() == 0 then Ok(None) else Err(Truncated)
+
+  // The next message's body as text; a body that is not UTF-8 is `Ok(Some(Err(…)))`, a fault of that
+  // message alone, since its length was read and the next message's start is known.
+  next() -> Result[Option[Result[string, string]], FramingError] = nextBytes()? match
+    None -> Ok(None)
+    Some(bytes) -> Ok(Some(string.fromUtf8(bytes).mapErr(e -> e.message)))
+
+  private available() -> int = pending.length - start
+
+  // A body of `length` bytes: what is pending first, then the rest read straight into the body, no
+  // more than it needs, so a large message is copied once.
+  private readBody(length: int) -> Result[Array[byte], FramingError]
+    if available() >= length
+      val body = pending.slice(start, start + length)
+      start += length
+      return Ok(body)
+    val body = Array.fill(length, byte(0))
+    var got = available()
+    pending.copyTo(body, 0, start, got)
+    pending = Array.empty[byte]()
+    start = 0
+    while got < length
+      if ended then return Err(Truncated)
+      val more = source.read(min(length - got, 65536)) match
+        Ok(bytes) -> bytes
+        Err(e) -> return Err(Unreadable(e.message))
+      if more.length == 0
+        ended = true
+        return Err(Truncated)
+      more.copyTo(body, got)
+      got += more.length
+    Ok(body)
+
+  // The offset, from `start`, of the `\r\n\r\n` ending the header block, looking from `from`; -1
+  // where it has not arrived.
+  private headerEnd(from: int) -> int
+    var i = from
+    while i + 3 < available()
+      val at = start + i
+      if isLineEnd(at) && isLineEnd(at + 2) then return i
+      i += 1
+    -1
+
+  // Whether the pending bytes at `at` are `\r\n`.
+  private isLineEnd(at: int) -> bool = int(pending(at)) == int('\r') && int(pending(at + 1)) == int('\n')
+
+  private headerText(until: int) -> string = string.fromUtf8Lossy(pending.slice(start, start + until))
+
+  // The body's length, from the header block.
+  private contentLength(headers: string) -> Result[int, FramingError]
+    var found: Option[int] = None
+    for line in headers.split("\r\n")
+      val colon = line.indexOf(":")
+      if colon < 0 then return Err(BadHeader(line.take(40)))
+      if line.slice(0, colon).trim.toLower == "content-length"
+        val text = line.slice(colon + 1, line.byteLength).trim
+        if text.isEmpty || !text.forall(c -> '0' <= c <= '9') then return Err(BadLength(text))
+        val n = text.toLongOption() match
+          Some(v) -> v
+          None -> return Err(BadLength(text))
+        if n > long(maxMessageBytes) then return Err(TooLarge(n, maxMessageBytes))
+        found = Some(int(n))
+    found match
+      Some(n) -> Ok(n)
+      None -> Err(MissingLength)
+
+  // Reads more from the source onto what is pending: `false` where the source has ended.
+  private fill() -> Result[bool, FramingError]
+    if ended then return Ok(false)
+    val more = source.read(65536) match
+      Ok(bytes) -> bytes
+      Err(e) -> return Err(Unreadable(e.message))
+    if more.length == 0
+      ended = true
+      return Ok(false)
+    val left = available()
+    val joined = Array.fill(left + more.length, byte(0))
+    pending.copyTo(joined, 0, start, left)
+    more.copyTo(joined, left)
+    pending = joined
+    start = 0
+    Ok(true)

@@ -1,0 +1,120 @@
+module dev.avinlang.lsp
+
+// The client's side of a connection, for driving a server from a test or a tool: it sends requests
+// and notifications and reads what the server writes, holding the messages that arrive while it waits
+// for another.
+import avin.io.{ByteWriter, Reader}
+import dev.avinlang.json
+import dev.avinlang.json.{Json, JsonDecoder, JsonEncoder, JsonError}
+
+// One message as it was read: its text, and its value.
+data Message(body: string, value: Json)
+
+private data ResultOf[R](result: R) derives JsonDecoder
+
+private data ParamsOf[P](params: P) derives JsonDecoder
+
+impl Message
+  // The id of a request or a response, `None` for a notification.
+  id -> Option[RequestId] = value.get("id") match
+    Some(Json.Long(n)) -> Some(Num(n))
+    Some(Json.Str(s)) -> Some(Text(s))
+    _ -> None
+
+  // The method of a request or a notification, `None` for a response.
+  method -> Option[string] = value.get("method").flatMap(m -> m.asString)
+
+  // A response's error, `None` for a response with a result.
+  error -> Option[ResponseError] = value.get("error").map(
+    e -> ResponseError(
+      e.get("code").flatMap(c -> c.asInt).getOrElse(0),
+      e.get("message").flatMap(m -> m.asString).getOrElse(""),
+      e.get("data")
+    )
+  )
+
+  // A response's result read as an `R`.
+  result[R: JsonDecoder]() -> Result[R, JsonError] = json.decode[ResultOf[R]](body).map(r -> r.result)
+
+  // A notification's or a request's params read as a `P`.
+  params[P: JsonDecoder]() -> Result[P, JsonError] = json.decode[ParamsOf[P]](body).map(p -> p.params)
+
+impl Display for Message
+  display(out: Writer, spec: FormatSpec) = out.writeField(body, spec)
+
+class Client(input: Reader, private val output: ByteWriter)
+  private val reader = MessageReader(input)
+  private var lastId: long = 0
+  private var held: Vector[Message] = []
+
+  // Sends a request of `method`, numbered one past the last, and answers its id.
+  request[P: JsonEncoder](method: string, params: P) -> RequestId
+    lastId += 1
+    val id = Num(lastId)
+    sendRequest(id, method, params)
+    id
+
+  // Sends a request with the id given.
+  sendRequest[P: JsonEncoder](id: RequestId, method: string, params: P) = send(requestText(id, method, params))
+
+  // Sends a notification of `method`.
+  notify[P: JsonEncoder](method: string, params: P) = send(notificationText(method, params))
+
+  // Sends `body` framed, whatever it holds.
+  send(body: string) = sendBytes(frame(body).utf8)
+
+  // Sends `bytes` as they are, framing and all.
+  sendBytes(bytes: Array[byte]) = output.write(bytes).ok.get
+
+  // The next message: one held while waiting for another first, then one read. `None` where the
+  // server's output has ended, or cannot be read.
+  receive() -> Option[Message]
+    if held.nonEmpty
+      val first = held(0)
+      held = held.drop(1)
+      return Some(first)
+    read()
+
+  // The response to request `id`, holding every message read before it.
+  response(id: RequestId) -> Option[Message] = until(m -> m.method.isEmpty && m.id == Some(id))
+
+  // The next notification of `method`, holding every message read before it.
+  notification(method: string) -> Option[Message] = until(m -> m.id.isEmpty && m.method == Some(method))
+
+  // Sends a request and waits for its response.
+  call[P: JsonEncoder](method: string, params: P) -> Option[Message] = response(request(method, params))
+
+  // Starts a session: `initialize` with `capabilities`, and `initialized` once it is answered;
+  // answers the `initialize` response.
+  initialize(capabilities: Json = Json.obj()) -> Option[Message]
+    val answer = call(
+      "initialize",
+      Json.obj(("processId", Json.Null), ("rootUri", Json.Null), ("capabilities", capabilities))
+    )
+    notify("initialized", Json.obj())
+    answer
+
+  // Ends a session: `shutdown`, then `exit`.
+  shutdown() -> Option[Message]
+    val answer = call("shutdown", Json.Null)
+    notify("exit", Json.Null)
+    answer
+
+  // The first message `wanted` takes, the ones before it held, from what is held and then from what is
+  // read.
+  private until(wanted: (Message) -> bool) -> Option[Message]
+    val i = held.indexWhere(wanted)
+    if i >= 0
+      val found = held(i)
+      held = held.take(i) ++ held.drop(i + 1)
+      return Some(found)
+    loop
+      val m = read() match
+        Some(m) -> m
+        None -> return None
+      if wanted(m) then return Some(m)
+      held = held :+ m
+
+  private read() -> Option[Message] = reader.next() match
+    Ok(Some(Ok(body))) -> json.parse(body).toOption.map(v -> Message(body, v))
+    _ -> None

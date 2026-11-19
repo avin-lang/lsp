@@ -1,0 +1,45 @@
+module dev.avinlang.lsp
+
+// The connections an editor starts a server on, named by the arguments it passes: `--pipe=<path>`,
+// a Unix domain socket the client listens on, and `--socket=<port>`, a TCP port on the local host
+// the client listens on. The server connects, and serves that connection until `exit`.
+import avin.io.IoError
+import avin.net.{StreamReader, StreamWriter, TcpStream, UnixStream}
+
+// Where to connect, from a server's arguments: `--pipe=<path>` or `--pipe <path>`, `--socket=<port>`
+// or `--socket <port>` (also spelt `--port`); `--clientProcessId` and any other argument is passed
+// over. `Err` says what is wrong.
+data Connection
+  Pipe(path: string)
+  Socket(port: int)
+
+connectionOf(args: Vector[string]) -> Result[Connection, string]
+  var found: Option[Connection] = None
+  var i = 0
+  while i < args.length
+    val arg = args(i)
+    val (name, value) = if arg.contains("=") then (
+      arg.slice(0, arg.indexOf("=")),
+      Some(arg.slice(arg.indexOf("=") + 1, arg.byteLength))
+    ) else (arg, None)
+    if name == "--pipe" || name == "--socket" || name == "--port"
+      val given = value match
+        Some(v) -> v
+        None ->
+          i += 1
+          if i >= args.length then return Err(s"$name names nothing")
+          args(i)
+      found = if name == "--pipe" then Some(Pipe(given)) else given.toIntOption() match
+        Some(port) if 0 < port < 65536 -> Some(Socket(port))
+        _ -> return Err(s"'$given' is not a port")
+    i += 1
+  found match
+    Some(c) -> Ok(c)
+    None -> Err(
+      "standard input and output cannot be read as bytes; start the server with --pipe=<path> or --socket=<port>"
+    )
+
+// The connection made, as its reading and writing halves.
+connect(c: Connection) -> Result[(StreamReader, StreamWriter), IoError] = c match
+  Pipe(path) -> UnixStream.connect(path).map(s -> s.split())
+  Socket(port) -> TcpStream.connect("127.0.0.1", port).map(s -> s.split())

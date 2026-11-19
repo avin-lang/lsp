@@ -1,0 +1,190 @@
+module tests
+
+// Every kind of handler, a round trip through the server: typed params in, a typed result out, read
+// back by the client as the protocol's JSON.
+import dev.avinlang.json.Json
+
+import dev.avinlang.lsp.{
+  CompletionItemKind, CompletionList, CompletionParams, Context, DocumentFormattingParams, DocumentSymbol,
+  DocumentSymbolParams, FormattingOptions, Hover, Location, Position, Range, ReferenceContext, ReferenceParams,
+  RenameParams, SemanticTokens, SemanticTokensParams, SymbolKind, TextDocumentIdentifier, TextEdit, WorkspaceEdit
+}
+
+val uri: string = "file:///doc.toy"
+
+doc() -> TextDocumentIdentifier = TextDocumentIdentifier(uri)
+
+span(l1: int, c1: int, l2: int, c2: int) -> Range = Range(Position(l1, c1), Position(l2, c2))
+
+// A started toy server with `text` open.
+withText(text: string) -> Running
+  val r = started(() -> toy())
+  open(r.client, uri, text)
+  r
+
+finish(r: Running) =
+  r.client.shutdown()
+  assertEq(r.ended(), 0)
+
+@test("hover: the word under the cursor in markdown with its range, and null where there is none")
+hover()
+  val r = withText("alpha beta ")
+  val c = r.client
+  val h = c.call("textDocument/hover", at(uri, 0, 7)).get
+  assertEq(h.result[Hover]().map(x -> x.contents.value), Ok("**beta**"))
+  assertEq(h.result[Hover]().map(x -> x.contents.kind), Ok("markdown"))
+  assertEq(h.result[Hover]().map(x -> x.range), Ok(Some(span(0, 6, 0, 10))))
+  assertEq(c.call("textDocument/hover", at(uri, 0, 5)).get.result[Hover]().map(x -> x.contents.value), Ok("**alpha**"))
+  assertEq(c.call("textDocument/hover", at(uri, 3, 0)).get.value.get("result"), Some(Json.Null))
+  assertEq(c.call("textDocument/hover", at("file:///none", 0, 0)).get.value.get("result"), Some(Json.Null))
+  finish(r)
+
+@test("hover past a surrogate pair places the word in UTF-16 units")
+hoverEmoji()
+  val r = withText("😀 word")
+  val h = r.client.call("textDocument/hover", at(uri, 0, 4)).get
+  assertEq(h.result[Hover]().map(x -> x.range), Ok(Some(span(0, 3, 0, 7))))
+  finish(r)
+
+@test("completion: a list of items with their kinds")
+completion()
+  val r = withText("pear apple\nfig")
+  val m = r.client.call("textDocument/completion", CompletionParams(doc(), Position(0, 0))).get
+  val list = m.result[CompletionList]().ok.get
+  assertEq(list.isIncomplete, false)
+  assertEq(list.items.map(i -> i.label), ["apple", "fig", "pear"])
+  assertEq(list.items(0).kind, Some(CompletionItemKind.Text))
+  assertEq(m.value("result")("items")(0).render, "{\"label\":\"apple\",\"kind\":1}")
+  finish(r)
+
+@test("definition: the word's first occurrence, and none for no word")
+definition()
+  val r = withText("go stop go ")
+  val c = r.client
+  assertEq(
+    c.call("textDocument/definition", at(uri, 0, 9)).get.result[Vector[Location]](),
+    Ok([Location(uri, span(0, 0, 0, 2))])
+  )
+  assertEq(
+    c.call("textDocument/definition", at(uri, 0, 2)).get.result[Vector[Location]](),
+    Ok([Location(uri, span(0, 0, 0, 2))])
+  )
+  assertEq(
+    c.call("textDocument/definition", at(uri, 5, 0)).get.result[Vector[Location]](),
+    Ok(Vector.empty[Location]())
+  )
+  finish(r)
+
+@test("references: every occurrence, with and without the declaration")
+references()
+  val r = withText("go stop go\ngo")
+  val c = r.client
+  val all = c.call("textDocument/references", ReferenceParams(doc(), Position(1, 1), ReferenceContext(true))).get
+  assertEq(
+    all.result[Vector[Location]]().map(ls -> ls.map(l -> l.range)),
+    Ok([span(0, 0, 0, 2), span(0, 8, 0, 10), span(1, 0, 1, 2)])
+  )
+  val rest = c.call("textDocument/references", ReferenceParams(doc(), Position(1, 1), ReferenceContext(false))).get
+  assertEq(rest.result[Vector[Location]]().map(ls -> ls.length), Ok(2))
+  finish(r)
+
+@test("document symbols: nested symbols written with their kinds, and children left empty")
+documentSymbols()
+  val r = withText("main is here\n  indented\nhelper")
+  val m = r.client.call("textDocument/documentSymbol", DocumentSymbolParams(doc())).get
+  val symbols = m.result[Vector[DocumentSymbol]]().ok.get
+  assertEq(symbols.map(s -> s.name), ["main", "helper"])
+  assertEq(symbols(0).kind, SymbolKind.Function)
+  assertEq(symbols(1).range, span(2, 0, 2, 6))
+  assertEq(symbols(1).detail, Some("line 2"))
+  assertEq(m.value("result")(0)("kind"), Json.num(12))
+  assertEq(m.value("result")(0)("children"), Json.arr())
+  finish(r)
+
+@test("formatting: the edits that trim trailing white space, and none for a tidy document")
+formatting()
+  val r = withText("a  \nb\nc\t")
+  val c = r.client
+  val options = FormattingOptions(2, true)
+  val edits = c.call(
+    "textDocument/formatting",
+    DocumentFormattingParams(doc(), options)
+  ).get.result[Vector[TextEdit]]().ok.get
+  assertEq(edits, [TextEdit(span(0, 1, 0, 3), ""), TextEdit(span(2, 1, 2, 2), "")])
+  open(c, "file:///tidy", "a\nb")
+  val none = c.call(
+    "textDocument/formatting",
+    DocumentFormattingParams(TextDocumentIdentifier("file:///tidy"), options)
+  ).get
+  assertEq(none.result[Vector[TextEdit]](), Ok(Vector.empty[TextEdit]()))
+  finish(r)
+
+@test("formatting options the client adds beyond the known ones are read past")
+formattingExtraOptions()
+  val r = withText("a ")
+  val params = Json.obj(
+    ("textDocument", Json.obj(("uri", Json.str(uri)))),
+    ("options", Json.obj(("tabSize", Json.num(4)), ("insertSpaces", Json.Bool(false)), ("custom", Json.str("x"))))
+  )
+  assertEq(r.client.call("textDocument/formatting", params).get.result[Vector[TextEdit]]().map(e -> e.length), Ok(1))
+  finish(r)
+
+@test("rename: a workspace edit of every occurrence, null for no word, and the handler's error")
+rename()
+  val r = withText("x  y x")
+  val c = r.client
+  val m = c.call("textDocument/rename", RenameParams(doc(), Position(0, 0), "z")).get
+  val edit = m.result[WorkspaceEdit]().ok.get
+  assertEq(edit.changes.get(uri), Some([TextEdit(span(0, 0, 0, 1), "z"), TextEdit(span(0, 5, 0, 6), "z")]))
+  assertEq(
+    m.value("result").render,
+    "{\"changes\":{\"file:///doc.toy\":[{\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":0,\"character\":1}},\"newText\":\"z\"},{\"range\":{\"start\":{\"line\":0,\"character\":5},\"end\":{\"line\":0,\"character\":6}},\"newText\":\"z\"}]}}"
+  )
+  assertEq(
+    c.call("textDocument/rename", RenameParams(doc(), Position(0, 2), "z")).get.value.get("result"),
+    Some(Json.Null)
+  )
+  assertEq(codeOf(c.call("textDocument/rename", RenameParams(doc(), Position(0, 0), "1"))), -32803)
+  finish(r)
+
+@test("semantic tokens: the words, each relative to the one before")
+semanticTokensFull()
+  val r = withText("ab cd\n  efg")
+  val m = r.client.call("textDocument/semanticTokens/full", SemanticTokensParams(doc())).get
+  assertEq(m.result[SemanticTokens]().map(t -> t.encoded), Ok([0, 0, 2, 0, 1, 0, 3, 2, 0, 0, 1, 2, 3, 0, 0]))
+  assertEq(m.value("result").render, "{\"data\":[0,0,2,0,1,0,3,2,0,0,1,2,3,0,0]}")
+  open(r.client, "file:///empty", "")
+  val empty = r.client.call(
+    "textDocument/semanticTokens/full",
+    SemanticTokensParams(TextDocumentIdentifier("file:///empty"))
+  ).get
+  assertEq(empty.result[SemanticTokens]().map(t -> t.encoded), Ok(Vector.empty[int]()))
+  finish(r)
+
+@test("diagnostics: published as a notification, with the severity and source written")
+diagnostics()
+  val r = started(() -> toy())
+  open(r.client, uri, "ok x")
+  val m = r.client.notification("textDocument/publishDiagnostics").get
+  assertEq(
+    m.value("params").render,
+    "{\"uri\":\"file:///doc.toy\",\"diagnostics\":[{\"range\":{\"start\":{\"line\":0,\"character\":3},\"end\":{\"line\":0,\"character\":4}},\"message\":\"an x\",\"severity\":2,\"source\":\"toy\"}],\"version\":1}"
+  )
+  finish(r)
+
+@test("a custom request with typed params and result")
+customRequest()
+  val r = withText("")
+  assertEq(r.client.call("toy/echo", Echo("ünïcode 😀")).get.result[Echo](), Ok(Echo("ünïcode 😀")))
+  finish(r)
+
+@test("a custom notification's handler runs in order with what arrives after it")
+customNotification()
+  val r = started(() -> toy().onNotification("toy/log", (ctx: Context, p: Echo) -> ctx.log(p.text)))
+  val c = r.client
+  c.notify("toy/log", Echo("noted"))
+  c.notify("toy/log", Json.obj(("other", Json.num(1))))
+  val m = c.notification("window/logMessage").get
+  assertEq(m.value("params").render, "{\"type\":4,\"message\":\"noted\"}")
+  c.shutdown()
+  assertEq(r.ended(), 0)

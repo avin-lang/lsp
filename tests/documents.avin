@@ -1,0 +1,163 @@
+module tests
+
+// Text synchronization: documents opened, changed whole and a piece at a time, and closed, as the
+// handlers see them, and the diagnostics published for each version.
+import dev.avinlang.json.Json
+
+import dev.avinlang.lsp.{
+  Client, DidChangeTextDocumentParams, DidCloseTextDocumentParams, DiagnosticSeverity, Position,
+  PublishDiagnosticsParams, Range, TextDocumentContentChangeEvent, TextDocumentIdentifier,
+  VersionedTextDocumentIdentifier
+}
+
+change(c: Client, uri: string, version: int, changes: Vector[TextDocumentContentChangeEvent]) =
+  c.notify(
+    "textDocument/didChange",
+    DidChangeTextDocumentParams(VersionedTextDocumentIdentifier(uri, version), changes)
+  )
+
+edit(l1: int, c1: int, l2: int, c2: int, text: string) -> TextDocumentContentChangeEvent =
+  TextDocumentContentChangeEvent(Some(Range(Position(l1, c1), Position(l2, c2))), text)
+
+// The document's text as the server holds it: the formatting handler's trimmed text is not it, so
+// the words the completion handler finds stand in.
+words(c: Client, uri: string) -> Vector[string] =
+  c.call(
+    "textDocument/completion",
+    at(uri, 0, 0)
+  ).get.value.get("result").get("items").asVector.get.map(i -> i("label").asString.get)
+
+// The next diagnostics published.
+published(c: Client) -> PublishDiagnosticsParams = c.notification(
+  "textDocument/publishDiagnostics"
+).get.params[PublishDiagnosticsParams]().ok.get
+
+@test("an opened document is what the handlers see, and its diagnostics are published with its version")
+opened()
+  val r = started(() -> toy())
+  val c = r.client
+  open(c, "file:///a", "alpha x beta", version = 3)
+  val d = published(c)
+  assertEq(d.uri, "file:///a")
+  assertEq(d.version, Some(3))
+  assertEq(d.diagnostics.length, 1)
+  assertEq(d.diagnostics(0).range, Range(Position(0, 6), Position(0, 7)))
+  assertEq(d.diagnostics(0).severity, Some(DiagnosticSeverity.Warning))
+  assertEq(d.diagnostics(0).source, Some("toy"))
+  assertEq(words(c, "file:///a"), ["alpha", "beta", "x"])
+  c.shutdown()
+  assertEq(r.ended(), 0)
+
+@test("a full change replaces the text, and the next diagnostics are the new version's")
+wholeTextChange()
+  val r = started(() -> toy())
+  val c = r.client
+  open(c, "file:///a", "one")
+  assertEq(published(c).diagnostics.length, 0)
+  change(c, "file:///a", 2, [TextDocumentContentChangeEvent(None, "x two x")])
+  val d = published(c)
+  assertEq(d.version, Some(2))
+  assertEq(d.diagnostics.length, 2)
+  assertEq(words(c, "file:///a"), ["two", "x"])
+  c.shutdown()
+  assertEq(r.ended(), 0)
+
+@test("incremental changes are applied in order, several in one notification")
+incremental()
+  val r = started(() -> toy())
+  val c = r.client
+  open(c, "file:///a", "hello world\nsecond")
+  published(c)
+  change(c, "file:///a", 2, [edit(0, 5, 0, 11, ""), edit(0, 5, 0, 5, " there"), edit(1, 0, 1, 6, "third")])
+  assertEq(published(c).version, Some(2))
+  assertEq(words(c, "file:///a"), ["hello", "there", "third"])
+  change(c, "file:///a", 3, [edit(1, 5, 1, 5, "\nfourth")])
+  published(c)
+  assertEq(words(c, "file:///a"), ["fourth", "hello", "there", "third"])
+  c.shutdown()
+  assertEq(r.ended(), 0)
+
+@test("an edit past the end of a document stops at its end")
+editPastEnd()
+  val r = started(() -> toy())
+  val c = r.client
+  open(c, "file:///a", "ab")
+  published(c)
+  change(c, "file:///a", 2, [edit(0, 1, 9, 9, "c")])
+  published(c)
+  assertEq(words(c, "file:///a"), ["ac"])
+  c.shutdown()
+  assertEq(r.ended(), 0)
+
+@test("incremental changes with emoji are placed in UTF-16 units")
+emojiChanges()
+  val r = started(() -> toy())
+  val c = r.client
+  open(c, "file:///a", "😀 ab")
+  published(c)
+  change(c, "file:///a", 2, [edit(0, 3, 0, 3, "x")])
+  val d = published(c)
+  assertEq(d.diagnostics(0).range, Range(Position(0, 3), Position(0, 4)))
+  assertEq(words(c, "file:///a"), ["xab"])
+  c.shutdown()
+  assertEq(r.ended(), 0)
+
+@test("closing a document clears its diagnostics and forgets it; a change to it then is passed over")
+closed()
+  val r = started(() -> toy())
+  val c = r.client
+  open(c, "file:///a", "x")
+  assertEq(published(c).diagnostics.length, 1)
+  c.notify("textDocument/didClose", DidCloseTextDocumentParams(TextDocumentIdentifier("file:///a")))
+  val cleared = published(c)
+  assertEq(cleared.diagnostics.length, 0)
+  assertEq(cleared.version, None)
+  assertEq(words(c, "file:///a"), Vector.empty[string]())
+  change(c, "file:///a", 2, [TextDocumentContentChangeEvent(None, "back")])
+  assertEq(words(c, "file:///a"), Vector.empty[string]())
+  c.shutdown()
+  assertEq(r.ended(), 0)
+
+@test("documents are kept apart, and an empty document is opened and filled")
+severalDocuments()
+  val r = started(() -> toy())
+  val c = r.client
+  open(c, "file:///a", "")
+  open(c, "file:///b", "bee")
+  change(c, "file:///a", 2, [edit(0, 0, 0, 0, "ay")])
+  assertEq(words(c, "file:///a"), ["ay"])
+  assertEq(words(c, "file:///b"), ["bee"])
+  c.shutdown()
+  assertEq(r.ended(), 0)
+
+@test("sync notifications whose params do not read are passed over")
+badSync()
+  val r = started(() -> toy())
+  val c = r.client
+  c.notify("textDocument/didOpen", Json.obj(("textDocument", Json.num(1))))
+  c.notify("textDocument/didChange", Json.obj())
+  c.notify("textDocument/didClose", Json.Null)
+  c.notify("$/cancelRequest", Json.obj(("id", Json.obj())))
+  assertEq(c.call("toy/echo", Echo("fine")).get.result[Echo](), Ok(Echo("fine")))
+  c.shutdown()
+  assertEq(r.ended(), 0)
+
+@test("a document changed many times publishes its last version's diagnostics last")
+lastVersionLast()
+  val r = started(() -> toy())
+  val c = r.client
+  open(c, "file:///a", "")
+  for v in 2 .. 40
+    change(c, "file:///a", v, [TextDocumentContentChangeEvent(None, "x".repeat(v))])
+  // Diagnostics of an earlier version may be dropped once a later one exists, but they never arrive
+  // out of order, and none comes after the last.
+  var last = published(c)
+  while last.version != Some(40)
+    val next = published(c)
+    assert(next.version.get > last.version.get)
+    last = next
+  assertEq(last.diagnostics.length, 40)
+  assertEq(c.call("toy/echo", Echo("end")).get.result[Echo](), Ok(Echo("end")))
+  c.shutdown()
+  assertEq(c.notification("textDocument/publishDiagnostics"), None)
+  assertEq(r.ended(), 0)

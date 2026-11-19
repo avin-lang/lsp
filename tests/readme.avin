@@ -1,0 +1,40 @@
+module tests
+
+// The README's example, run: a server for a toy language that publishes a diagnostic and answers
+// hover.
+import dev.avinlang.json.Json
+
+import dev.avinlang.lsp.{
+  Diagnostic, DiagnosticSeverity, Hover, MarkupContent, Position, PositionEncoding, PublishDiagnosticsParams, Range,
+  Server, TextDocument
+}
+
+// Every line that is not blank and has no `=`, as an error.
+check(doc: TextDocument, encoding: PositionEncoding) -> Vector[Diagnostic] = (0 ..< doc.lineCount).toVector.flatMap(line ->
+  val text = doc.lineText(line)
+  if text.isBlank || text.contains("=") then None
+  else
+    val start = doc.offsetAt(Position(line, 0), encoding)
+    val whole = Range(Position(line, 0), doc.positionAt(start + text.byteLength, encoding))
+    Some(Diagnostic(whole, "expected `name = value`", Some(DiagnosticSeverity.Error))))
+
+readmeServer() -> Server = Server("settings", "0.1")
+  .onDiagnostics((ctx, doc) -> check(doc, ctx.encoding))
+  .onHover((ctx, p) -> Ok(ctx.document(p.textDocument.uri).map(doc ->
+    Hover(MarkupContent.plain(s"line ${p.position.line + 1}: ${doc.lineText(p.position.line)}")))))
+
+@test("the README's server publishes a diagnostic for a line with no `=` and answers hover")
+readmeExample()
+  val r = started(() -> readmeServer())
+  val c = r.client
+  open(c, "file:///app.settings", "name = demo\nport 80\n")
+  val published = c.notification("textDocument/publishDiagnostics").get.params[PublishDiagnosticsParams]().ok.get
+  assertEq(
+    published.diagnostics.map(d -> (d.range, d.message)),
+    [(Range(Position(1, 0), Position(1, 7)), "expected `name = value`")]
+  )
+  val hover = c.call("textDocument/hover", at("file:///app.settings", 1, 2)).get.result[Hover]().ok.get
+  assertEq(hover.contents, MarkupContent.plain("line 2: port 80"))
+  assertEq(c.call("textDocument/hover", at("file:///other", 0, 0)).get.value.get("result"), Some(Json.Null))
+  c.shutdown()
+  assertEq(r.ended(), 0)

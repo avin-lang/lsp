@@ -1,0 +1,105 @@
+module tests
+
+// Framing: a message read however its source cuts it, and every way a header block can be wrong.
+import dev.avinlang.lsp.{MessageReader, frame}
+
+// Every body `r` gives, as text, until it ends or fails; a failure is the last entry, as `!<message>`.
+bodies(r: MessageReader) -> Vector[string]
+  var out: Vector[string] = []
+  loop
+    r.next() match
+      Ok(None) -> return out
+      Ok(Some(Ok(body))) -> out = out :+ body
+      Ok(Some(Err(why))) -> out = out :+ s"?$why"
+      Err(e) -> return out :+ s"!${e.message}"
+
+@test("a message is its Content-Length header, a blank line and the body, its length counted in bytes")
+framed()
+  assertEq(frame("{}"), "Content-Length: 2\r\n\r\n{}")
+  assertEq(frame("é"), "Content-Length: 2\r\n\r\né")
+  assertEq(frame("🎉"), "Content-Length: 4\r\n\r\n🎉")
+  assertEq(frame(""), "Content-Length: 0\r\n\r\n")
+
+@test("one message, and several in one read")
+several()
+  assertEq(bodies(MessageReader(pieces(frame("{\"a\":1}")))), ["{\"a\":1}"])
+  assertEq(bodies(MessageReader(pieces(frame("1") + frame("22") + frame("")))), ["1", "22", ""])
+  assertEq(bodies(MessageReader(pieces())), Vector.empty[string]())
+
+@test("a header split across reads, at every byte")
+splitHeaders()
+  val text = frame("{\"x\":true}") + frame("[]")
+  for cut in 1 ..< text.byteLength
+    val r = MessageReader(ChunkReader([text.utf8.slice(0, cut), text.utf8.slice(cut, text.byteLength)]))
+    assertEq(bodies(r), ["{\"x\":true}", "[]"])
+
+@test("a body arriving a byte at a time, and a body of several reads")
+bodyAcrossReads()
+  val text = frame("héllo 🎉 world")
+  val bytes = text.utf8
+  val r = MessageReader(ChunkReader(Vector.tabulate(bytes.length, i -> bytes.slice(i, i + 1))))
+  assertEq(bodies(r), ["héllo 🎉 world"])
+
+@test("a large message, read whole, and the message after it")
+large()
+  val big = "{\"text\":\"" + "abcdefgh".repeat(400000) + "\"}"
+  val r = MessageReader(pieces(frame(big) + frame("after")))
+  val got = bodies(r)
+  assertEq(got.length, 2)
+  assertEq(got(0).byteLength, big.byteLength)
+  assert(got(0) == big)
+  assertEq(got(1), "after")
+
+@test("a message past the limit is refused before its body is read")
+tooLarge()
+  assertEq(
+    bodies(MessageReader(pieces(frame("12345")), maxMessageBytes = 4)),
+    ["!a message of 5 bytes, past the limit of 4"]
+  )
+  assertEq(bodies(MessageReader(pieces(frame("1234")), maxMessageBytes = 4)), ["1234"])
+  assertEq(
+    bodies(MessageReader(pieces("Content-Length: 99999999999999999999999\r\n\r\n"))),
+    ["!'99999999999999999999999' is not a Content-Length"]
+  )
+
+@test("other headers are read and passed over, and header names are matched without regard to case")
+extraHeaders()
+  val text = "Content-Type: application/vscode-jsonrpc; charset=utf-8\r\ncontent-length: 2\r\nX-Other: yes\r\n\r\n{}"
+  assertEq(bodies(MessageReader(pieces(text))), ["{}"])
+  assertEq(bodies(MessageReader(pieces("CONTENT-LENGTH:3\r\n\r\nabc"))), ["abc"])
+  assertEq(bodies(MessageReader(pieces("Content-Length:   3  \r\n\r\nabc"))), ["abc"])
+
+@test("a header block with no Content-Length")
+missingLength()
+  assertEq(bodies(MessageReader(pieces("Content-Type: x\r\n\r\n{}"))), ["!a message with no Content-Length header"])
+  assertEq(bodies(MessageReader(pieces(frame("1") + "\r\n\r\n"))), ["1", "!'' is not a header"])
+
+@test("a Content-Length that is not a count of bytes")
+badLength()
+  assertEq(bodies(MessageReader(pieces("Content-Length: abc\r\n\r\n{}"))), ["!'abc' is not a Content-Length"])
+  assertEq(bodies(MessageReader(pieces("Content-Length: -2\r\n\r\n{}"))), ["!'-2' is not a Content-Length"])
+  assertEq(bodies(MessageReader(pieces("Content-Length: \r\n\r\n{}"))), ["!'' is not a Content-Length"])
+  assertEq(bodies(MessageReader(pieces("Content-Length: 1.5\r\n\r\n{}"))), ["!'1.5' is not a Content-Length"])
+
+@test("a header line with no colon, and a header block that never ends")
+badHeader()
+  assertEq(bodies(MessageReader(pieces("Content-Length 2\r\n\r\n{}"))), ["!'Content-Length 2' is not a header"])
+  val endless = "X: " + "y".repeat(10000)
+  assertEq(bodies(MessageReader(pieces(endless))), ["!'X: yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy' is not a header"])
+
+@test("input that ends inside a header or a body")
+truncated()
+  assertEq(bodies(MessageReader(pieces("Content-Len"))), ["!the input ended inside a message"])
+  assertEq(bodies(MessageReader(pieces("Content-Length: 10\r\n\r\n{}"))), ["!the input ended inside a message"])
+  assertEq(
+    bodies(MessageReader(pieces(frame("ok") + "Content-Length: 5\r\n\r\nab"))),
+    ["ok", "!the input ended inside a message"]
+  )
+
+@test("a body that is not UTF-8 is that message's fault, and the next message is still read")
+notUtf8()
+  val bad = ChunkReader(["Content-Length: 2\r\n\r\n".utf8, Array.fill(2, byte(0xff)), frame("next").utf8])
+  val got = bodies(MessageReader(bad))
+  assertEq(got.length, 2)
+  assert(got(0).startsWith("?"))
+  assertEq(got(1), "next")

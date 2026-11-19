@@ -1,0 +1,172 @@
+module tests
+
+// JSON-RPC: ids of both kinds written back as they came, notifications never answered, and each
+// kind of bad message answered with its code.
+import avin.threads.Channel
+import dev.avinlang.json.Json
+
+import dev.avinlang.lsp.{
+  InvalidParams, InvalidRequest, MethodNotFound, ParseError, RequestId, Server
+}
+
+echoing() -> Server = toy()
+
+@test("a request with a number id is answered with that id, and its result")
+numberId()
+  val r = started(() -> echoing())
+  val c = r.client
+  c.sendRequest(RequestId.Num(41), "toy/echo", Echo("hi"))
+  val m = c.response(RequestId.Num(41)).get
+  assertEq(m.result[Echo](), Ok(Echo("hi")))
+  assertEq(m.value.get("id"), Some(Json.num(41)))
+  assertEq(m.value.get("jsonrpc"), Some(Json.str("2.0")))
+  c.sendRequest(RequestId.Num(-9223372036854775807), "toy/echo", Echo("min"))
+  assertEq(c.response(RequestId.Num(-9223372036854775807)).get.result[Echo](), Ok(Echo("min")))
+  c.sendRequest(RequestId.Num(0), "toy/echo", Echo("zero"))
+  assertEq(c.response(RequestId.Num(0)).get.result[Echo](), Ok(Echo("zero")))
+  c.shutdown()
+  assertEq(r.ended(), 0)
+
+@test("a request with a string id is answered with that string, Unicode and empty ones too")
+stringId()
+  val r = started(() -> echoing())
+  val c = r.client
+  for id in ["abc", "", "ünï 😀", "42"]
+    c.sendRequest(RequestId.Text(id), "toy/echo", Echo(id))
+    val m = c.response(RequestId.Text(id)).get
+    assertEq(m.value.get("id"), Some(Json.str(id)))
+    assertEq(m.result[Echo](), Ok(Echo(id)))
+  c.shutdown()
+  assertEq(r.ended(), 0)
+
+@test("a notification gets no response, a known one, an unknown one and one beginning $/")
+notificationsUnanswered()
+  val r = started(() -> echoing())
+  val c = r.client
+  c.notify("toy/nothing", Json.obj())
+  c.notify("$/setTrace", Json.obj(("value", Json.str("off"))))
+  c.notify("initialized", Json.obj())
+  c.send("{\"jsonrpc\":\"2.0\",\"method\":\"toy/echo\",\"params\":{\"text\":\"as a notification\"}}")
+  val id = c.request("toy/echo", Echo("after"))
+  val next = c.receive().get
+  assertEq(next.id, Some(id))
+  assertEq(next.result[Echo](), Ok(Echo("after")))
+  c.shutdown()
+  assertEq(r.ended(), 0)
+
+@test("text that is not JSON is a parse error, answered with a null id, and the server goes on")
+parseError()
+  val r = started(() -> echoing())
+  val c = r.client
+  for bad in ["{", "nonsense", "{\"jsonrpc\":\"2.0\",}", ""]
+    c.send(bad)
+    val m = c.receive().get
+    assertEq(m.error.map(e -> e.code), Some(ParseError))
+    assertEq(m.value.get("id"), Some(Json.Null))
+  assertEq(c.call("toy/echo", Echo("still")).get.result[Echo](), Ok(Echo("still")))
+  c.shutdown()
+  assertEq(r.ended(), 0)
+
+@test("JSON that is not a request is an invalid request")
+invalidRequest()
+  val r = started(() -> echoing())
+  val c = r.client
+  val bad = [
+    "{\"jsonrpc\":\"2.0\",\"id\":1}",
+    "{\"jsonrpc\":\"1.0\",\"id\":2,\"method\":\"toy/echo\",\"params\":{\"text\":\"x\"}}",
+    "{\"id\":3,\"method\":\"toy/echo\",\"params\":{\"text\":\"x\"}}",
+    "{\"jsonrpc\":\"2.0\",\"id\":{\"a\":1},\"method\":\"toy/echo\"}",
+    "{\"jsonrpc\":\"2.0\",\"id\":1.5,\"method\":\"toy/echo\"}",
+    "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":7}",
+    "17",
+    "\"text\""
+  ]
+  for text in bad
+    c.send(text)
+    assertEq(c.receive().get.error.map(e -> e.code), Some(InvalidRequest))
+  c.shutdown()
+  assertEq(r.ended(), 0)
+
+@test("an invalid request answers with its id where its id could be read")
+invalidRequestId()
+  val r = started(() -> echoing())
+  val c = r.client
+  c.send("{\"jsonrpc\":\"1.0\",\"id\":\"mine\",\"method\":\"toy/echo\"}")
+  val m = c.receive().get
+  assertEq(m.value.get("id"), Some(Json.str("mine")))
+  assertEq(m.error.map(e -> e.code), Some(InvalidRequest))
+  c.shutdown()
+  assertEq(r.ended(), 0)
+
+@test("a batch is refused with one invalid request, and nothing in it is run")
+batch()
+  val r = started(() -> echoing())
+  val c = r.client
+  c.send("[{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"toy/echo\",\"params\":{\"text\":\"a\"}}]")
+  val m = c.receive().get
+  assertEq(m.error.map(e -> e.message), Some("a batch of messages is not supported"))
+  assertEq(m.error.map(e -> e.code), Some(InvalidRequest))
+  assertEq(m.value.get("id"), Some(Json.Null))
+  c.send("  [ ]")
+  assertEq(c.receive().get.error.map(e -> e.code), Some(InvalidRequest))
+  val id = c.request("toy/echo", Echo("b"))
+  assertEq(c.receive().get.id, Some(id))
+  c.shutdown()
+  assertEq(r.ended(), 0)
+
+@test("an unknown method is answered MethodNotFound, $/ methods among them")
+unknownMethod()
+  val r = started(() -> echoing())
+  val c = r.client
+  val m = c.call("toy/nosuch", Json.obj()).get
+  assertEq(m.error.map(e -> e.code), Some(MethodNotFound))
+  assertEq(m.error.map(e -> e.message), Some("'toy/nosuch' is not a method this server answers"))
+  assertEq(codeOf(c.call("$/nosuch", Json.obj())), MethodNotFound)
+  c.shutdown()
+  assertEq(r.ended(), 0)
+
+@test("params that do not read as the handler's type are InvalidParams, naming what is wrong")
+invalidParams()
+  val r = started(() -> echoing())
+  val c = r.client
+  val wrong = c.call("toy/echo", Json.obj(("text", Json.num(5)))).get.error.get
+  assertEq(wrong.code, InvalidParams)
+  assert(wrong.message.contains("text"))
+  assertEq(codeOf(c.call("toy/echo", Json.obj())), InvalidParams)
+  assertEq(codeOf(c.call("toy/echo", Json.Null)), InvalidParams)
+  assertEq(codeOf(c.call("textDocument/hover", Json.obj(("textDocument", Json.num(1))))), InvalidParams)
+  c.send("{\"jsonrpc\":\"2.0\",\"id\":99,\"method\":\"toy/echo\"}")
+  assertEq(codeOf(c.response(RequestId.Num(99))), InvalidParams)
+  c.shutdown()
+  assertEq(r.ended(), 0)
+
+@test("a handler's own error is the response's error, with its data")
+handlerError()
+  val r = started(() -> echoing())
+  val c = r.client
+  open(c, "file:///a", "word")
+  val m = c.call(
+    "textDocument/rename",
+    Json.obj(
+      ("textDocument", Json.obj(("uri", Json.str("file:///a")))),
+      ("position", Json.obj(("line", Json.num(0)), ("character", Json.num(1)))),
+      ("newName", Json.str("no good"))
+    )
+  ).get
+  assertEq(m.error.map(e -> e.message), Some("'no good' is not a word"))
+  assertEq(m.value.get("error").flatMap(e -> e.get("data")), None)
+  c.shutdown()
+  assertEq(r.ended(), 0)
+
+@test("a request reusing the id of one still being answered is refused")
+duplicateId()
+  val gate = Channel[int]()
+  val r = started(() -> gated(gate))
+  val c = r.client
+  c.sendRequest(RequestId.Num(5), "toy/wait", Json.obj())
+  c.sendRequest(RequestId.Num(5), "toy/wait", Json.obj())
+  assertEq(codeOf(c.receive()), InvalidRequest)
+  gate.send(1)
+  assertEq(c.receive().get.result[int](), Ok(1))
+  c.shutdown()
+  assertEq(r.ended(), 0)

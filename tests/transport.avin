@@ -1,0 +1,26 @@
+module tests
+
+// The arguments an editor starts a server with, read as the connection to make.
+import dev.avinlang.lsp.{Connection, connectionOf}
+
+@test("--pipe and --socket, with = or as the next argument, and --port as --socket")
+connections()
+  assertEq(connectionOf(["--pipe=/tmp/x.sock"]), Ok(Connection.Pipe("/tmp/x.sock")))
+  assertEq(connectionOf(["--pipe", "/tmp/y"]), Ok(Connection.Pipe("/tmp/y")))
+  assertEq(connectionOf(["--socket=5007"]), Ok(Connection.Socket(5007)))
+  assertEq(connectionOf(["--socket", "1"]), Ok(Connection.Socket(1)))
+  assertEq(connectionOf(["--port=65535"]), Ok(Connection.Socket(65535)))
+  assertEq(connectionOf(["--clientProcessId=42", "--pipe=/p"]), Ok(Connection.Pipe("/p")))
+  assertEq(connectionOf(["--pipe=/a=b"]), Ok(Connection.Pipe("/a=b")))
+  assertEq(connectionOf(["--pipe=/first", "--socket=9"]), Ok(Connection.Socket(9)))
+
+@test("no connection, a name with no value, and a port out of range")
+badConnections()
+  assert(connectionOf([]).isErr)
+  assert(connectionOf(["--stdio"]).err.get.contains("--pipe=<path> or --socket=<port>"))
+  assertEq(connectionOf(["--pipe"]), Err("--pipe names nothing"))
+  assertEq(connectionOf(["--socket"]), Err("--socket names nothing"))
+  assertEq(connectionOf(["--socket=0"]), Err("'0' is not a port"))
+  assertEq(connectionOf(["--socket=65536"]), Err("'65536' is not a port"))
+  assertEq(connectionOf(["--socket=x"]), Err("'x' is not a port"))
+  assertEq(connectionOf(["--socket=-1"]), Err("'-1' is not a port"))

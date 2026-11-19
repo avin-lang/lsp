@@ -1,0 +1,153 @@
+module tests
+
+// Requests answered on threads of their own: answers out of order, many at once, cancellation, and
+// progress reported on a request's token.
+import avin.threads.Channel
+import dev.avinlang.json.Json
+import dev.avinlang.lsp.{Context, RequestCancelled, RequestId, ResponseError, Server}
+
+@test("a quick request is answered while a slow one waits, and the slow one after")
+outOfOrder()
+  val gate = Channel[int]()
+  val r = started(() -> gated(gate))
+  val c = r.client
+  val slow = c.request("toy/wait", Json.obj())
+  val quick = c.request("toy/echo", Echo("quick"))
+  val first = c.receive().get
+  assertEq(first.id, Some(quick))
+  gate.send(7)
+  val second = c.receive().get
+  assertEq(second.id, Some(slow))
+  assertEq(second.result[int](), Ok(7))
+  c.shutdown()
+  assertEq(r.ended(), 0)
+
+@test("many requests at once are each answered once, with their own result")
+many()
+  val r = started(() -> toy())
+  val c = r.client
+  val n = 500
+  var ids: Vector[RequestId] = []
+  for i in 0 ..< n
+    ids = ids :+ c.request("toy/echo", Echo(s"n$i"))
+  var seen = HashMap.empty[RequestId, string]()
+  for _ in 0 ..< n
+    val m = c.receive().get
+    assert(seen.get(m.id.get).isEmpty)
+    seen = seen.updated(m.id.get, m.result[Echo]().ok.get.text)
+  for i in 0 ..< n
+    assertEq(seen.get(ids(i)), Some(s"n$i"))
+  c.shutdown()
+  assertEq(r.ended(), 0)
+
+@test("many slow requests wait at once, and are answered in the order they are let go")
+manyWaiting()
+  val gate = Channel[int]()
+  val r = started(() -> gated(gate))
+  val c = r.client
+  for _ in 0 ..< 50
+    c.request("toy/wait", Json.obj())
+  assertEq(c.call("toy/echo", Echo("meanwhile")).get.result[Echo](), Ok(Echo("meanwhile")))
+  var got: Vector[int] = []
+  for i in 0 ..< 50
+    gate.send(i)
+    got = got :+ c.receive().get.result[int]().ok.get
+  assertEq(got.sorted, (0 ..< 50).toVector)
+  c.shutdown()
+  assertEq(r.ended(), 0)
+
+@test("a cancelled request is answered RequestCancelled once, and its handler sees the cancellation")
+cancelled()
+  val seen = Channel[int]()
+  val r = started(() -> gated(Channel[int](), seen))
+  val c = r.client
+  c.sendRequest(RequestId.Num(50), "toy/spin", Json.obj())
+  c.notify("$/cancelRequest", Json.obj(("id", Json.num(50))))
+  val m = c.response(RequestId.Num(50)).get
+  assertEq(m.error.map(e -> e.code), Some(RequestCancelled))
+  assertEq(seen.receive(), Some(1))
+  // The handler's own answer, made after, is dropped: the next message is the next request's.
+  val next = c.request("toy/echo", Echo("next"))
+  assertEq(c.receive().get.id, Some(next))
+  c.shutdown()
+  assertEq(r.ended(), 0)
+
+@test("a cancellation of a request with a string id")
+cancelledText()
+  val seen = Channel[int]()
+  val r = started(() -> gated(Channel[int](), seen))
+  val c = r.client
+  c.sendRequest(RequestId.Text("job"), "toy/spin", Json.obj())
+  c.notify("$/cancelRequest", Json.obj(("id", Json.str("job"))))
+  assertEq(codeOf(c.response(RequestId.Text("job"))), RequestCancelled)
+  assertEq(seen.receive(), Some(1))
+  c.shutdown()
+  assertEq(r.ended(), 0)
+
+@test("a cancellation for an unknown id, or one already answered, is passed over")
+cancelUnknown()
+  val r = started(() -> toy())
+  val c = r.client
+  c.notify("$/cancelRequest", Json.obj(("id", Json.num(999))))
+  c.notify("$/cancelRequest", Json.obj(("id", Json.str("nobody"))))
+  val done = c.request("toy/echo", Echo("done"))
+  assertEq(c.receive().get.id, Some(done))
+  c.notify("$/cancelRequest", Json.obj(("id", Json.num(1))))
+  val after = c.request("toy/echo", Echo("after"))
+  val m = c.receive().get
+  assertEq(m.id, Some(after))
+  assertEq(m.error, None)
+  c.shutdown()
+  assertEq(r.ended(), 0)
+
+@test("a cancelled request's id may be used again once it is answered")
+cancelledIdReused()
+  val seen = Channel[int]()
+  val r = started(() -> gated(Channel[int](), seen))
+  val c = r.client
+  c.sendRequest(RequestId.Num(3), "toy/spin", Json.obj())
+  c.notify("$/cancelRequest", Json.obj(("id", Json.num(3))))
+  assertEq(codeOf(c.response(RequestId.Num(3))), RequestCancelled)
+  assertEq(seen.receive(), Some(1))
+  // The handler removes its request as it finishes, just after `seen`; a reuse may race that, so it
+  // is retried until the first is gone.
+  var answer = -1
+  while answer != 0
+    c.sendRequest(RequestId.Num(3), "toy/echo", Echo("again"))
+    answer = codeOf(c.response(RequestId.Num(3)))
+  c.shutdown()
+  assertEq(r.ended(), 0)
+
+reporting() -> Server = toy().onRequest("toy/progress", (ctx: Context, p: Json) ->
+  ctx.beginProgress("Working", percentage = Some(0))
+  ctx.reportProgress(Some("half"), Some(50))
+  ctx.endProgress(Some("done"))
+  Ok[bool, ResponseError](true))
+
+@test("progress is reported on the request's work-done token, and not at all without one")
+progress()
+  val r = started(() -> reporting())
+  val c = r.client
+  val id = c.request("toy/progress", Json.obj(("workDoneToken", Json.str("tok"))))
+  val begin = c.notification("$/progress").get
+  assertEq(
+    begin.value("params").render,
+    "{\"token\":\"tok\",\"value\":{\"kind\":\"begin\",\"title\":\"Working\",\"percentage\":0}}"
+  )
+  assertEq(
+    c.notification("$/progress").get.value("params").render,
+    "{\"token\":\"tok\",\"value\":{\"kind\":\"report\",\"message\":\"half\",\"percentage\":50}}"
+  )
+  assertEq(
+    c.notification("$/progress").get.value("params").render,
+    "{\"token\":\"tok\",\"value\":{\"kind\":\"end\",\"message\":\"done\"}}"
+  )
+  assertEq(c.response(id).get.result[bool](), Ok(true))
+  val numbered = c.request("toy/progress", Json.obj(("workDoneToken", Json.num(8))))
+  for _ in 0 ..< 3
+    assertEq(c.notification("$/progress").get.value("params")("token"), Json.num(8))
+  c.response(numbered).get
+  val silent = c.request("toy/progress", Json.obj())
+  assertEq(c.receive().get.id, Some(silent))
+  c.shutdown()
+  assertEq(r.ended(), 0)

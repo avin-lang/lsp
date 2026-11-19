@@ -1,0 +1,86 @@
+// A language server for plain words, answering every kind of request the package types: a hover
+// names the word under the cursor, a definition is the word's first occurrence and its references
+// all of them, completion offers the document's words, each line's first word is a symbol,
+// formatting trims trailing spaces, a rename replaces every occurrence, every word is a semantic
+// token, and each `TODO` is a warning. Started as an editor starts a server: `--pipe=<path>` or
+// `--socket=<port>`.
+import dev.avinlang.lsp.{
+  CompletionItem, CompletionItemKind, CompletionList, Context, Diagnostic, DiagnosticSeverity, DocumentSymbol, Hover,
+  Location, MarkupContent, Position, PositionEncoding, Range, ResponseError, SemanticToken, SemanticTokensLegend,
+  Server, SymbolKind, TextDocument, TextEdit, WorkspaceEdit, semanticTokens
+}
+
+main(args: Vector[string]) -> int = server().serveArgs(args)
+
+server() -> Server = Server("words", "1.0")
+  .onDiagnostics((ctx, doc) -> todos(doc, ctx.encoding))
+  .onHover((ctx, p) -> Ok(found(ctx, p.textDocument.uri, p.position).headOption.map(w ->
+    Hover(MarkupContent.plain(s"the word ${w.text}"), Some(w.range)))))
+  .onDefinition((ctx, p) -> Ok(occurrences(ctx, p.textDocument.uri, p.position).take(1)))
+  .onReferences((ctx, p) -> Ok(occurrences(ctx, p.textDocument.uri, p.position)))
+  .onCompletion((ctx, p) -> Ok(CompletionList(false, everyWord(ctx, p.textDocument.uri).map(w ->
+    CompletionItem(w, kind = Some(CompletionItemKind.Text))))))
+  .onDocumentSymbols((ctx, p) -> Ok(firstWords(ctx, p.textDocument.uri)))
+  .onFormatting((ctx, p) -> Ok(trailingSpace(ctx, p.textDocument.uri)))
+  .onRename((ctx, p) -> renamed(ctx, p.textDocument.uri, p.position, p.newName))
+  .onSemanticTokens(SemanticTokensLegend(["variable"]), (ctx, p) -> Ok(semanticTokens(words(ctx, p.textDocument.uri).map(w ->
+    SemanticToken(w.range.start.line, w.range.start.character, w.range.end.character - w.range.start.character, 0)))))
+
+// A word and where it is.
+data Word(text: string, range: Range)
+
+isLetter(c: char) -> bool = 'a' <= c <= 'z' || 'A' <= c <= 'Z'
+
+// Every word of the document at `uri`, in order.
+words(ctx: Context, uri: string) -> Vector[Word] = ctx.document(uri) match
+  Some(doc) -> wordsIn(doc, ctx.encoding)
+  None -> []
+
+wordsIn(doc: TextDocument, encoding: PositionEncoding) -> Vector[Word]
+  val out = Vector.newBuilder[Word]()
+  val text = doc.text
+  var at = 0
+  while at < text.byteLength
+    if isLetter(text.charAt(at))
+      var until = at
+      while until < text.byteLength && isLetter(text.charAt(until)) do until += 1
+      out.addOne(Word(text.slice(at, until), Range(doc.positionAt(at, encoding), doc.positionAt(until, encoding))))
+      at = until
+    else
+      at += text.charAt(at).toString().byteLength
+  out.result()
+
+// The word whose range holds `p`, start and end included, as a vector of none or one.
+found(ctx: Context, uri: string, p: Position) -> Vector[Word] = words(ctx, uri).filter(w -> holds(w.range, p)).take(1)
+
+holds(r: Range, p: Position) -> bool = r.start.line == p.line && r.start.character <= p.character <= r.end.character
+
+occurrences(ctx: Context, uri: string, p: Position) -> Vector[Location] = found(ctx, uri, p).headOption match
+  Some(w) -> words(ctx, uri).filter(o -> o.text == w.text).map(o -> Location(uri, o.range))
+  None -> []
+
+everyWord(ctx: Context, uri: string) -> Vector[string] = words(ctx, uri).map(w -> w.text).distinct.sorted
+
+firstWords(ctx: Context, uri: string) -> Vector[DocumentSymbol]
+  val all = words(ctx, uri)
+  all.filter(w -> w.range.start.character == 0).map(w -> DocumentSymbol(w.text, SymbolKind.String, w.range, w.range))
+
+trailingSpace(ctx: Context, uri: string) -> Vector[TextEdit] = ctx.document(uri) match
+  None -> []
+  Some(doc) -> (0 ..< doc.lineCount).toVector.flatMap(line ->
+    val text = doc.lineText(line)
+    val kept = text.stripTrailing
+    if kept.byteLength == text.byteLength then None
+    else
+      val first = doc.offsetAt(Position(line, 0), ctx.encoding)
+      Some(TextEdit(Range(doc.positionAt(first + kept.byteLength, ctx.encoding), doc.positionAt(first + text.byteLength, ctx.encoding)), "")))
+
+renamed(ctx: Context, uri: string, p: Position, name: string) -> Result[Option[WorkspaceEdit], ResponseError]
+  if name.isEmpty || !name.forall(isLetter) then return Err(ResponseError(-32803, s"'$name' is not a word"))
+  val edits = occurrences(ctx, uri, p).map(l -> TextEdit(l.range, name))
+  Ok(if edits.isEmpty then None else Some(WorkspaceEdit(TreeMap((uri, edits)))))
+
+// Each `TODO` in the document, as a warning.
+todos(doc: TextDocument, encoding: PositionEncoding) -> Vector[Diagnostic] =
+  wordsIn(doc, encoding).filter(w -> w.text == "TODO").map(w ->
+    Diagnostic(w.range, "something left to do", Some(DiagnosticSeverity.Warning), source = Some("words")))

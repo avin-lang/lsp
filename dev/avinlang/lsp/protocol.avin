@@ -1,0 +1,289 @@
+module dev.avinlang.lsp
+
+// The protocol's types, each written and read as the specification's JSON by derived encoders and
+// decoders. A field the specification makes optional is an `Option` left out of what is written
+// when it is `None`, and a decoder reads past every member a type has no field for.
+import dev.avinlang.json.{Json, JsonDecoder, JsonEncoder, JsonError, JsonKey, JsonReader, JsonWriter}
+
+// A progress token: a whole number or a string, as a request id is.
+type ProgressToken = RequestId
+
+// A place in a document: a line counted from zero, and a character offset in that line counted in
+// the units of the position encoding agreed at `initialize`.
+data Position(line: int, character: int) derives JsonEncoder, JsonDecoder
+
+// The text from `start` up to `end`, which it does not include.
+data Range(start: Position, end: Position) derives JsonEncoder, JsonDecoder
+
+data Location(uri: string, range: Range) derives JsonEncoder, JsonDecoder
+
+data TextDocumentIdentifier(uri: string) derives JsonEncoder, JsonDecoder
+
+data VersionedTextDocumentIdentifier(uri: string, version: int) derives JsonEncoder, JsonDecoder
+
+data TextDocumentItem(uri: string, languageId: string, version: int, text: string) derives JsonEncoder, JsonDecoder
+
+// A change to a document: the text replacing `range`, or the whole text where there is no range.
+data TextDocumentContentChangeEvent(range: Option[Range] = None, text: string) derives JsonEncoder, JsonDecoder
+
+data DidOpenTextDocumentParams(textDocument: TextDocumentItem) derives JsonEncoder, JsonDecoder
+
+data DidChangeTextDocumentParams(
+    textDocument: VersionedTextDocumentIdentifier,
+    contentChanges: Vector[TextDocumentContentChangeEvent]
+) derives JsonEncoder, JsonDecoder
+
+data DidCloseTextDocumentParams(textDocument: TextDocumentIdentifier) derives JsonEncoder, JsonDecoder
+
+// The params of a hover and of a definition: a document and a place in it.
+data TextDocumentPositionParams(
+    textDocument: TextDocumentIdentifier,
+    position: Position
+) derives JsonEncoder, JsonDecoder
+
+data CompletionContext(triggerKind: int, triggerCharacter: Option[string] = None) derives JsonEncoder, JsonDecoder
+
+data CompletionParams(
+    textDocument: TextDocumentIdentifier,
+    position: Position,
+    context: Option[CompletionContext] = None
+) derives JsonEncoder, JsonDecoder
+
+data ReferenceContext(includeDeclaration: bool) derives JsonEncoder, JsonDecoder
+
+data ReferenceParams(
+    textDocument: TextDocumentIdentifier,
+    position: Position,
+    context: ReferenceContext
+) derives JsonEncoder, JsonDecoder
+
+data DocumentSymbolParams(textDocument: TextDocumentIdentifier) derives JsonEncoder, JsonDecoder
+
+data FormattingOptions(
+    tabSize: int,
+    insertSpaces: bool,
+    trimTrailingWhitespace: Option[bool] = None,
+    insertFinalNewline: Option[bool] = None,
+    trimFinalNewlines: Option[bool] = None
+) derives JsonEncoder, JsonDecoder
+
+data DocumentFormattingParams(
+    textDocument: TextDocumentIdentifier,
+    options: FormattingOptions
+) derives JsonEncoder, JsonDecoder
+
+data RenameParams(
+    textDocument: TextDocumentIdentifier,
+    position: Position,
+    newName: string
+) derives JsonEncoder, JsonDecoder
+
+data SemanticTokensParams(textDocument: TextDocumentIdentifier) derives JsonEncoder, JsonDecoder
+
+// Text shown to the user: `plaintext` or `markdown`.
+data MarkupContent(kind: string, value: string) derives JsonEncoder, JsonDecoder
+
+object MarkupContent
+  plain(value: string) -> MarkupContent = MarkupContent("plaintext", value)
+  markdown(value: string) -> MarkupContent = MarkupContent("markdown", value)
+
+data Hover(contents: MarkupContent, range: Option[Range] = None) derives JsonEncoder, JsonDecoder
+
+data CompletionItem(
+    label: string,
+    kind: Option[CompletionItemKind] = None,
+    detail: Option[string] = None,
+    documentation: Option[MarkupContent] = None,
+    insertText: Option[string] = None,
+    textEdit: Option[TextEdit] = None,
+    sortText: Option[string] = None,
+    filterText: Option[string] = None
+) derives JsonEncoder, JsonDecoder
+
+data CompletionList(isIncomplete: bool, items: Vector[CompletionItem]) derives JsonEncoder, JsonDecoder
+
+data DocumentSymbol(
+    name: string,
+    kind: SymbolKind,
+    range: Range,
+    selectionRange: Range,
+    detail: Option[string] = None,
+    children: Vector[DocumentSymbol] = []
+) derives JsonEncoder, JsonDecoder
+
+data TextEdit(range: Range, newText: string) derives JsonEncoder, JsonDecoder
+
+// The edits a rename makes, by document.
+data WorkspaceEdit(changes: TreeMap[string, Vector[TextEdit]]) derives JsonEncoder, JsonDecoder
+
+data SemanticTokensLegend(
+    tokenTypes: Vector[string],
+    tokenModifiers: Vector[string] = []
+) derives JsonEncoder, JsonDecoder
+
+// The tokens of a document, five numbers each, as the specification encodes them; `semanticTokens`
+// makes them from tokens placed absolutely.
+data SemanticTokens(@JsonKey("data") encoded: Vector[int]) derives JsonEncoder, JsonDecoder
+
+// One token placed absolutely: its line, its first character and its length in the position
+// encoding's units, its type's index in the legend and its modifiers as bits of the legend's.
+data SemanticToken(line: int, character: int, length: int, tokenType: int, modifiers: int = 0)
+
+// `tokens` encoded as the protocol sends them: sorted by place, each relative to the one before.
+semanticTokens(tokens: Vector[SemanticToken]) -> SemanticTokens
+  val sorted = tokens.sortBy(t -> (t.line, t.character))
+  val out = Vector.newBuilder[int]()
+  var line = 0
+  var character = 0
+  for t in sorted
+    val deltaLine = t.line - line
+    out.addOne(deltaLine)
+    out.addOne(if deltaLine == 0 then t.character - character else t.character)
+    out.addOne(t.length)
+    out.addOne(t.tokenType)
+    out.addOne(t.modifiers)
+    line = t.line
+    character = t.character
+  SemanticTokens(out.result())
+
+data Diagnostic(
+    range: Range,
+    message: string,
+    severity: Option[DiagnosticSeverity] = None,
+    code: Option[string] = None,
+    source: Option[string] = None
+) derives JsonEncoder, JsonDecoder
+
+data PublishDiagnosticsParams(
+    uri: string,
+    diagnostics: Vector[Diagnostic],
+    version: Option[int] = None
+) derives JsonEncoder, JsonDecoder
+
+// What `window/logMessage` carries: a type from 1, an error, to 4, a log line, and the message.
+data LogMessageParams(@JsonKey("type") kind: int, message: string) derives JsonEncoder, JsonDecoder
+
+// What `$/progress` carries.
+data ProgressParams[V](token: ProgressToken, value: V) derives JsonEncoder, JsonDecoder
+
+data WorkDoneProgress(
+    kind: string,
+    title: Option[string] = None,
+    message: Option[string] = None,
+    percentage: Option[int] = None
+) derives JsonEncoder, JsonDecoder
+
+data ClientInfo(name: string, version: Option[string] = None) derives JsonEncoder, JsonDecoder
+
+data GeneralClientCapabilities(positionEncodings: Option[Vector[string]] = None) derives JsonEncoder, JsonDecoder
+
+// The client's capabilities: the general ones a server reads, and the rest as they came.
+data ClientCapabilities(
+    general: Option[GeneralClientCapabilities] = None,
+    textDocument: Option[Json] = None,
+    workspace: Option[Json] = None,
+    window: Option[Json] = None
+) derives JsonEncoder, JsonDecoder
+
+data InitializeParams(
+    processId: Option[long] = None,
+    clientInfo: Option[ClientInfo] = None,
+    rootUri: Option[string] = None,
+    capabilities: ClientCapabilities = ClientCapabilities(),
+    initializationOptions: Option[Json] = None
+) derives JsonEncoder, JsonDecoder
+
+data ServerInfo(name: string, version: Option[string] = None) derives JsonEncoder, JsonDecoder
+
+data InitializeResult(capabilities: Json, serverInfo: ServerInfo) derives JsonEncoder, JsonDecoder
+
+// A diagnostic's severity, written as its number.
+data DiagnosticSeverity(code: int)
+
+object DiagnosticSeverity
+  val Error: DiagnosticSeverity = DiagnosticSeverity(1)
+  val Warning: DiagnosticSeverity = DiagnosticSeverity(2)
+  val Information: DiagnosticSeverity = DiagnosticSeverity(3)
+  val Hint: DiagnosticSeverity = DiagnosticSeverity(4)
+
+// A symbol's kind, written as its number.
+data SymbolKind(code: int)
+
+object SymbolKind
+  val File: SymbolKind = SymbolKind(1)
+  val Module: SymbolKind = SymbolKind(2)
+  val Namespace: SymbolKind = SymbolKind(3)
+  val Package: SymbolKind = SymbolKind(4)
+  val Class: SymbolKind = SymbolKind(5)
+  val Method: SymbolKind = SymbolKind(6)
+  val Property: SymbolKind = SymbolKind(7)
+  val Field: SymbolKind = SymbolKind(8)
+  val Constructor: SymbolKind = SymbolKind(9)
+  val Enum: SymbolKind = SymbolKind(10)
+  val Interface: SymbolKind = SymbolKind(11)
+  val Function: SymbolKind = SymbolKind(12)
+  val Variable: SymbolKind = SymbolKind(13)
+  val Constant: SymbolKind = SymbolKind(14)
+  val String: SymbolKind = SymbolKind(15)
+  val Number: SymbolKind = SymbolKind(16)
+  val Boolean: SymbolKind = SymbolKind(17)
+  val Array: SymbolKind = SymbolKind(18)
+  val Object: SymbolKind = SymbolKind(19)
+  val Key: SymbolKind = SymbolKind(20)
+  val Null: SymbolKind = SymbolKind(21)
+  val EnumMember: SymbolKind = SymbolKind(22)
+  val Struct: SymbolKind = SymbolKind(23)
+  val Event: SymbolKind = SymbolKind(24)
+  val Operator: SymbolKind = SymbolKind(25)
+  val TypeParameter: SymbolKind = SymbolKind(26)
+
+// A completion's kind, written as its number.
+data CompletionItemKind(code: int)
+
+object CompletionItemKind
+  val Text: CompletionItemKind = CompletionItemKind(1)
+  val Method: CompletionItemKind = CompletionItemKind(2)
+  val Function: CompletionItemKind = CompletionItemKind(3)
+  val Constructor: CompletionItemKind = CompletionItemKind(4)
+  val Field: CompletionItemKind = CompletionItemKind(5)
+  val Variable: CompletionItemKind = CompletionItemKind(6)
+  val Class: CompletionItemKind = CompletionItemKind(7)
+  val Interface: CompletionItemKind = CompletionItemKind(8)
+  val Module: CompletionItemKind = CompletionItemKind(9)
+  val Property: CompletionItemKind = CompletionItemKind(10)
+  val Unit: CompletionItemKind = CompletionItemKind(11)
+  val Value: CompletionItemKind = CompletionItemKind(12)
+  val Enum: CompletionItemKind = CompletionItemKind(13)
+  val Keyword: CompletionItemKind = CompletionItemKind(14)
+  val Snippet: CompletionItemKind = CompletionItemKind(15)
+  val Color: CompletionItemKind = CompletionItemKind(16)
+  val File: CompletionItemKind = CompletionItemKind(17)
+  val Reference: CompletionItemKind = CompletionItemKind(18)
+  val Folder: CompletionItemKind = CompletionItemKind(19)
+  val EnumMember: CompletionItemKind = CompletionItemKind(20)
+  val Constant: CompletionItemKind = CompletionItemKind(21)
+  val Struct: CompletionItemKind = CompletionItemKind(22)
+  val Event: CompletionItemKind = CompletionItemKind(23)
+  val Operator: CompletionItemKind = CompletionItemKind(24)
+  val TypeParameter: CompletionItemKind = CompletionItemKind(25)
+
+impl JsonEncoder for DiagnosticSeverity
+  encode(out: JsonWriter) = out.long(long(code))
+
+impl JsonDecoder for DiagnosticSeverity
+  static decode(r: JsonReader) -> Result[DiagnosticSeverity, JsonError] = r.readInt().map(n -> DiagnosticSeverity(n))
+  static whenMissing() -> Option[DiagnosticSeverity] = None
+
+impl JsonEncoder for SymbolKind
+  encode(out: JsonWriter) = out.long(long(code))
+
+impl JsonDecoder for SymbolKind
+  static decode(r: JsonReader) -> Result[SymbolKind, JsonError] = r.readInt().map(n -> SymbolKind(n))
+  static whenMissing() -> Option[SymbolKind] = None
+
+impl JsonEncoder for CompletionItemKind
+  encode(out: JsonWriter) = out.long(long(code))
+
+impl JsonDecoder for CompletionItemKind
+  static decode(r: JsonReader) -> Result[CompletionItemKind, JsonError] = r.readInt().map(n -> CompletionItemKind(n))
+  static whenMissing() -> Option[CompletionItemKind] = None

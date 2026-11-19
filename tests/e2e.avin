@@ -1,0 +1,160 @@
+module tests
+
+// End to end: the example server `examples/words`, built once and started as an editor starts a
+// server, as a child process connecting back over a Unix domain socket (`--pipe`) or a TCP port
+// (`--socket`). Every kind of handler makes a round trip through it, and its exit status is the
+// protocol's.
+import avin.fs
+import avin.net.{StreamWriter, TcpListener, UnixListener}
+import avin.process.{Child, Command, ExitStatus}
+import avin.time.seconds
+import dev.avinlang.json.Json
+
+import dev.avinlang.lsp.{
+  Client, CompletionList, CompletionParams, DidOpenTextDocumentParams, DocumentFormattingParams, DocumentSymbol,
+  DocumentSymbolParams, FormattingOptions, Hover, InitializeResult, Location, Position, PublishDiagnosticsParams, Range,
+  ReferenceContext, ReferenceParams, RenameParams, SemanticTokens, SemanticTokensParams, TextDocumentIdentifier,
+  TextDocumentItem, TextEdit, WorkspaceEdit
+}
+
+// The example server, built once for every test here.
+lazy val wordsServer: string = build()
+
+build() -> string
+  val out = ".avin/test/words"
+  _ = fs.createDirAll(".avin/test")
+  val status = Command("avin", "build", "examples/words", "-o", out).run().ok.get
+  assertEq(status, ExitStatus.Exited(0))
+  out
+
+// A child server and a client of it.
+class ChildServer(val client: Client, private val output: StreamWriter, val child: Child, private val dir: string)
+  // Closes the client's side of the connection, so the server's input ends.
+  hangUp() = _ = output.close()
+
+  ended() -> ExitStatus
+    val status = child.waitFor().ok.get
+    _ = fs.removeDirAll(dir)
+    status
+
+// The example server started with `--pipe` naming a socket this test listens on.
+piped() -> ChildServer
+  val dir = fs.createTempDir("lsp-e2e-").ok.get
+  val socket = dir + "/s"
+  val listener = UnixListener.bind(socket).ok.get
+  val child = Command(wordsServer, s"--pipe=$socket").start().ok.get
+  val conn = listener.accept().ok.get
+  conn.setTimeout(seconds(20)).ok.get
+  val (input, output) = conn.split()
+  ChildServer(Client(input, output), output, child, dir)
+
+docId() -> TextDocumentIdentifier = TextDocumentIdentifier(uri)
+
+@test("every kind of handler, a round trip through a child process over a Unix domain socket")
+everyHandler()
+  val s = piped()
+  val c = s.client
+  val init = c.initialize().get.result[InitializeResult]().ok.get
+  assertEq(init.serverInfo.name, "words")
+  c.notify(
+    "textDocument/didOpen",
+    DidOpenTextDocumentParams(TextDocumentItem(uri, "words", 1, "alpha TODO  \nbeta alpha"))
+  )
+  val diags = c.notification("textDocument/publishDiagnostics").get.params[PublishDiagnosticsParams]().ok.get
+  assertEq(diags.diagnostics.map(d -> d.range), [span(0, 6, 0, 10)])
+  assertEq(diags.version, Some(1))
+  val hover = c.call("textDocument/hover", at(uri, 1, 6)).get.result[Hover]().ok.get
+  assertEq(hover.contents.value, "the word alpha")
+  assertEq(hover.range, Some(span(1, 5, 1, 10)))
+  assertEq(
+    c.call("textDocument/definition", at(uri, 1, 6)).get.result[Vector[Location]](),
+    Ok([Location(uri, span(0, 0, 0, 5))])
+  )
+  val refs = c.call(
+    "textDocument/references",
+    ReferenceParams(docId(), Position(0, 1), ReferenceContext(true))
+  ).get.result[Vector[Location]]().ok.get
+  assertEq(refs.map(l -> l.range), [span(0, 0, 0, 5), span(1, 5, 1, 10)])
+  val completion = c.call(
+    "textDocument/completion",
+    CompletionParams(docId(), Position(0, 0))
+  ).get.result[CompletionList]().ok.get
+  assertEq(completion.items.map(i -> i.label), ["TODO", "alpha", "beta"])
+  val symbols = c.call(
+    "textDocument/documentSymbol",
+    DocumentSymbolParams(docId())
+  ).get.result[Vector[DocumentSymbol]]().ok.get
+  assertEq(symbols.map(s -> s.name), ["alpha", "beta"])
+  val edits = c.call(
+    "textDocument/formatting",
+    DocumentFormattingParams(docId(), FormattingOptions(2, true))
+  ).get.result[Vector[TextEdit]]().ok.get
+  assertEq(edits, [TextEdit(span(0, 10, 0, 12), "")])
+  val rename = c.call(
+    "textDocument/rename",
+    RenameParams(docId(), Position(0, 2), "gamma")
+  ).get.result[WorkspaceEdit]().ok.get
+  assertEq(rename.changes.get(uri).map(es -> es.map(e -> e.range)), Some([span(0, 0, 0, 5), span(1, 5, 1, 10)]))
+  assertEq(
+    c.call(
+      "textDocument/rename",
+      RenameParams(docId(), Position(0, 2), "no")
+    ).get.result[WorkspaceEdit]().map(e -> e.changes.size),
+    Ok(1)
+  )
+  assertEq(
+    c.call("textDocument/rename", RenameParams(docId(), Position(0, 2), "1")).get.error.map(e -> e.code),
+    Some(-32803)
+  )
+  val tokens = c.call(
+    "textDocument/semanticTokens/full",
+    SemanticTokensParams(docId())
+  ).get.result[SemanticTokens]().ok.get
+  assertEq(tokens.encoded, [0, 0, 5, 0, 0, 0, 6, 4, 0, 0, 1, 0, 4, 0, 0, 0, 5, 5, 0, 0])
+  assertEq(c.call("toy/nosuch", Json.obj()).get.error.map(e -> e.code), Some(-32601))
+  c.shutdown()
+  assertEq(s.ended(), ExitStatus.Exited(0))
+
+@test("a child server told exit without shutdown exits with status 1")
+childExitWithoutShutdown()
+  val s = piped()
+  s.client.initialize().get
+  s.client.notify("exit", Json.Null)
+  assertEq(s.ended(), ExitStatus.Exited(1))
+
+@test("a child server whose input ends exits with status 1")
+childInputEnds()
+  val s = piped()
+  s.client.initialize().get
+  s.client.sendBytes("Content-Length: 5\r\n\r\n{}".utf8)
+  s.hangUp()
+  assertEq(s.ended(), ExitStatus.Exited(1))
+
+@test("a child server over a TCP port")
+overTcp()
+  val listener = TcpListener.bind("127.0.0.1", 0).ok.get
+  val child = Command(wordsServer, "--socket", s"${listener.port()}").start().ok.get
+  val conn = listener.accept().ok.get
+  conn.setTimeout(seconds(20)).ok.get
+  val (input, output) = conn.split()
+  val c = Client(input, output)
+  c.initialize().get
+  c.notify("textDocument/didOpen", DidOpenTextDocumentParams(TextDocumentItem(uri, "words", 1, "one two")))
+  assertEq(
+    c.call("textDocument/hover", at(uri, 0, 5)).get.result[Hover]().map(h -> h.contents.value),
+    Ok("the word two")
+  )
+  c.shutdown()
+  assertEq(child.waitFor().ok.get, ExitStatus.Exited(0))
+
+@test("a server given no connection, or one that cannot be made, exits with status 2")
+noConnection()
+  for args in [
+    Vector.empty[string](),
+    ["--stdio"],
+    ["--pipe=/nonexistent/socket"],
+    ["--socket=notaport"],
+    ["--socket=0"],
+    ["--pipe"]
+  ]
+    assertEq(Command(wordsServer, args*).errorsToFile("/dev/null").run().ok.get, ExitStatus.Exited(2))

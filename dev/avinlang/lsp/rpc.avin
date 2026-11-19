@@ -1,0 +1,88 @@
+module dev.avinlang.lsp
+
+// JSON-RPC 2.0 as the protocol uses it: the id a request carries, the error a request is answered
+// with, and the messages a server writes.
+import dev.avinlang.json
+import dev.avinlang.json.{Json, JsonDecoder, JsonEncoder, JsonError, JsonKey, JsonOmitNone, JsonReader, JsonWriter}
+
+// The JSON-RPC and protocol error codes.
+val ParseError: int = -32700
+val InvalidRequest: int = -32600
+val MethodNotFound: int = -32601
+val InvalidParams: int = -32602
+val InternalError: int = -32603
+val ServerNotInitialized: int = -32002
+val UnknownErrorCode: int = -32001
+val RequestFailed: int = -32803
+val ServerCancelled: int = -32802
+val ContentModified: int = -32801
+val RequestCancelled: int = -32800
+
+// A request's id: a whole number or a string, written back in the response as it came.
+data RequestId
+  Num(value: long)
+  Text(value: string)
+
+impl Display for RequestId
+  display(out: Writer, spec: FormatSpec) = self match
+    Num(n) -> out.writeField(s"$n", spec)
+    Text(s) -> out.writeField(json.quote(s), spec)
+
+impl JsonEncoder for RequestId
+  encode(out: JsonWriter) = self match
+    Num(n) -> out.long(n)
+    Text(s) -> out.string(s)
+
+impl JsonDecoder for RequestId
+  static decode(r: JsonReader) -> Result[RequestId, JsonError] = r.readValue()? match
+    Json.Long(n) -> Ok(Num(n))
+    Json.Str(s) -> Ok(Text(s))
+    _ -> Err(r.error("an id is a whole number or a string"))
+  static whenMissing() -> Option[RequestId] = None
+
+// What a request is answered with when it fails: a code, a sentence, and anything more as JSON,
+// written under `data`.
+data ResponseError(
+    code: int,
+    message: string,
+    @JsonKey("data") @ JsonOmitNone detail: Option[Json] = None
+) derives JsonEncoder, JsonDecoder
+
+impl Display for ResponseError
+  display(out: Writer, spec: FormatSpec) = out.writeField(s"$message ($code)", spec)
+
+// What every message's top says: whether it is JSON-RPC 2.0, its id, its method, and whether it is a
+// response, which has a result or an error and no method. The params are passed over unread.
+private data Head(
+    jsonrpc: Option[string] = None,
+    id: Option[RequestId] = None,
+    method: Option[string] = None,
+    result: Option[Json] = None,
+    error: Option[Json] = None
+) derives JsonDecoder
+
+// A message's params, read as the type a handler takes.
+private data Params[P](params: P) derives JsonDecoder
+
+// The work-done token a request's params may carry.
+private data TokenParams(workDoneToken: Option[ProgressToken] = None) derives JsonDecoder
+
+private data WithToken(params: Option[TokenParams] = None) derives JsonDecoder
+
+// A response carrying `result`, text already written as JSON.
+responseText(
+    id: RequestId,
+    result: string
+) -> string = s"{\"jsonrpc\":\"2.0\",\"id\":${json.encode(id)},\"result\":$result}"
+
+// A response carrying `error`; an id the request's text did not give is `null`.
+errorText(id: Option[RequestId], error: ResponseError) -> string =
+  s"{\"jsonrpc\":\"2.0\",\"id\":${json.encode(id)},\"error\":${json.encode(error, omitNone = true)}}"
+
+// A notification of `method` with `params`.
+notificationText[P: JsonEncoder](method: string, params: P) -> string =
+  s"{\"jsonrpc\":\"2.0\",\"method\":${json.quote(method)},\"params\":${json.encode(params, omitNone = true)}}"
+
+// A request of `method` with `params`.
+requestText[P: JsonEncoder](id: RequestId, method: string, params: P) -> string =
+  s"{\"jsonrpc\":\"2.0\",\"id\":${json.encode(id)},\"method\":${json.quote(method)},\"params\":${json.encode(params, omitNone = true)}}"

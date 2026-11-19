@@ -1,0 +1,148 @@
+module tests
+
+// The lifecycle: nothing before `initialize`, `initialize` once, nothing after `shutdown`, and the
+// exit status `exit` gives; the capabilities announced are those of the handlers registered.
+import dev.avinlang.json.Json
+
+import dev.avinlang.lsp.{
+  InitializeResult, InvalidRequest, RequestId, Server, ServerNotInitialized, TextDocumentPositionParams
+}
+
+@test("a request before initialize is answered ServerNotInitialized, and a notification is dropped")
+beforeInitialize()
+  val r = connected(() -> toy())
+  val c = r.client
+  open(c, "file:///a", "x")
+  val m = c.call("toy/echo", Echo("early")).get
+  assertEq(m.error.map(e -> e.code), Some(ServerNotInitialized))
+  assertEq(m.error.map(e -> e.message), Some("'toy/echo' before 'initialize'"))
+  assertEq(codeOf(c.call("shutdown", Json.Null)), ServerNotInitialized)
+  c.initialize().get
+  // The document opened before `initialize` was dropped: its hover finds nothing.
+  assertEq(c.call("textDocument/hover", at("file:///a", 0, 0)).get.value.get("result"), Some(Json.Null))
+  c.shutdown()
+  assertEq(r.ended(), 0)
+
+@test("exit without shutdown ends the server with status 1")
+exitWithoutShutdown()
+  val r = started(() -> toy())
+  r.client.notify("exit", Json.Null)
+  assertEq(r.ended(), 1)
+
+@test("exit before initialize ends the server with status 1")
+exitBeforeInitialize()
+  val r = connected(() -> toy())
+  r.client.notify("exit", Json.Null)
+  assertEq(r.ended(), 1)
+
+@test("shutdown is answered null, and exit after it ends the server with status 0")
+shutdownThenExit()
+  val r = started(() -> toy())
+  val m = r.client.call("shutdown", Json.Null).get
+  assertEq(m.value.get("result"), Some(Json.Null))
+  assertEq(m.error, None)
+  r.client.notify("exit", Json.Null)
+  assertEq(r.ended(), 0)
+
+@test("a request after shutdown is an invalid request, and a notification after it is dropped")
+afterShutdown()
+  val r = started(() -> toy())
+  val c = r.client
+  c.call("shutdown", Json.Null).get
+  open(c, "file:///late", "text")
+  val m = c.call("toy/echo", Echo("late")).get
+  assertEq(m.error.map(e -> e.code), Some(InvalidRequest))
+  assertEq(m.error.map(e -> e.message), Some("'toy/echo' after 'shutdown'"))
+  assertEq(codeOf(c.call("shutdown", Json.Null)), InvalidRequest)
+  c.notify("exit", Json.Null)
+  assertEq(r.ended(), 0)
+
+@test("initialize a second time is an invalid request")
+initializeTwice()
+  val r = started(() -> toy())
+  assertEq(codeOf(r.client.call("initialize", Json.obj(("capabilities", Json.obj())))), InvalidRequest)
+  r.client.shutdown()
+  assertEq(r.ended(), 0)
+
+@test("initialize whose params do not read is InvalidParams, and the server stays uninitialized")
+initializeBadParams()
+  val r = connected(() -> toy())
+  val c = r.client
+  assertEq(codeOf(c.call("initialize", Json.obj(("capabilities", Json.num(3))))), -32602)
+  assertEq(codeOf(c.call("toy/echo", Echo("x"))), ServerNotInitialized)
+  c.initialize().get
+  c.shutdown()
+  assertEq(r.ended(), 0)
+
+@test("input that ends without exit ends the server with status 1")
+inputEnds()
+  val r = started(() -> toy())
+  r.hangUp()
+  assertEq(r.ended(), 1)
+
+@test("a framing fault ends the server with status 1")
+framingFault()
+  val r = started(() -> toy())
+  r.client.sendBytes("Content-Length: nope\r\n\r\n{}".utf8)
+  assertEq(r.ended(), 1)
+
+@test("the server's name and version, and the capabilities of every handler registered")
+capabilities()
+  val r = connected(() -> toy())
+  val result = r.client.initialize().get.result[InitializeResult]().ok.get
+  assertEq(result.serverInfo.name, "toy")
+  assertEq(result.serverInfo.version, Some("1.0"))
+  val caps = result.capabilities
+  assertEq(caps.get("positionEncoding"), Some(Json.str("utf-16")))
+  assertEq(caps.get("textDocumentSync").map(s -> s.render), Some("{\"openClose\":true,\"change\":2}"))
+  for name in [
+    "hoverProvider",
+    "definitionProvider",
+    "referencesProvider",
+    "documentSymbolProvider",
+    "documentFormattingProvider",
+    "renameProvider"
+  ]
+    assertEq(caps.get(name), Some(Json.Bool(true)))
+  assertEq(caps.get("completionProvider").map(s -> s.render), Some("{\"triggerCharacters\":[\".\"]}"))
+  assertEq(
+    caps.get("semanticTokensProvider").map(s -> s.render),
+    Some("{\"legend\":{\"tokenTypes\":[\"variable\"],\"tokenModifiers\":[\"declaration\"]},\"full\":true}")
+  )
+  r.client.shutdown()
+  assertEq(r.ended(), 0)
+
+@test("a server with no handler announces only text synchronization, and answers every method MethodNotFound")
+bareCapabilities()
+  val r = connected(() -> bare())
+  val result = r.client.initialize().get.result[InitializeResult]().ok.get
+  assertEq(result.capabilities.keys, ["positionEncoding", "textDocumentSync"])
+  assertEq(result.serverInfo.version, None)
+  assertEq(codeOf(r.client.call("textDocument/hover", at("file:///a", 0, 0))), -32601)
+  r.client.shutdown()
+  assertEq(r.ended(), 0)
+
+@test("UTF-8 positions are agreed where the client offers them")
+utf8Agreed()
+  val offered = Json.obj(("general", Json.obj(("positionEncodings", Json.arr(Json.str("utf-8"), Json.str("utf-16"))))))
+  val r = connected(() -> toy())
+  val result = r.client.initialize(offered).get.result[InitializeResult]().ok.get
+  assertEq(result.capabilities.get("positionEncoding"), Some(Json.str("utf-8")))
+  open(r.client, "file:///u", "😀 word")
+  val hover = r.client.call("textDocument/hover", at("file:///u", 0, 6)).get
+  assertEq(
+    hover.value.get("result").flatMap(h -> h.get("range")).map(j -> j.render),
+    Some("{\"start\":{\"line\":0,\"character\":5},\"end\":{\"line\":0,\"character\":9}}")
+  )
+  r.client.shutdown()
+  assertEq(r.ended(), 0)
+
+@test("a handler registered again replaces the first, and its capability is announced once")
+reregistered()
+  val r = connected(() -> toy().onHover((ctx, p) -> Ok(None)))
+  val result = r.client.initialize().get.result[InitializeResult]().ok.get
+  assertEq(result.capabilities.keys.filter(k -> k == "hoverProvider").length, 1)
+  open(r.client, "file:///a", "word")
+  assertEq(r.client.call("textDocument/hover", at("file:///a", 0, 1)).get.value.get("result"), Some(Json.Null))
+  r.client.shutdown()
+  assertEq(r.ended(), 0)

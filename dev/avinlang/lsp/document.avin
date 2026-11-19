@@ -1,0 +1,130 @@
+module dev.avinlang.lsp
+
+// Documents the editor has open, and positions in them. A position's character counts the units of
+// the encoding agreed at `initialize`: UTF-16 code units, the protocol's default, where a character
+// beyond U+FFFF counts two, or UTF-8 bytes. A document's text is an Avin string, so an offset into it
+// is a byte offset, and the two meet here.
+
+// How a position's character is counted.
+data PositionEncoding
+  Utf8
+  Utf16
+
+impl PositionEncoding
+  // The name the protocol gives it.
+  name -> string = self match
+    Utf8 -> "utf-8"
+    Utf16 -> "utf-16"
+
+  // How many units `c` counts.
+  units(c: char) -> int = self match
+    Utf8 -> c.toString().byteLength
+    Utf16 -> if int(c) >= 0x10000 then 2 else 1
+
+// The encoding to use, from the encodings a client offers at `initialize`: UTF-8 where it is
+// offered, since it counts as the text is held, and UTF-16, which every client knows, otherwise.
+negotiate(offered: Vector[string]) -> PositionEncoding = if offered.contains("utf-8") then Utf8 else Utf16
+
+// A document as the editor has it: where it is, its language, the version the editor last gave it,
+// and its text. Lines end at `\n`, `\r\n` or `\r`, as the protocol counts them.
+class TextDocument(val uri: string, val languageId: string, val version: int, val text: string)
+  // The byte offset each line starts at.
+  val lineStarts: Vector[int] = startsOf(text)
+
+  lineCount -> int = lineStarts.length
+
+  // The byte offset `p` names. A line past the last is the end of the text, a character past its
+  // line's end is the end of the line, before its terminator, and a character inside a character's
+  // units, between the two halves of a surrogate pair, is that character's start.
+  offsetAt(p: Position, encoding: PositionEncoding = Utf16) -> int
+    if p.line < 0 then return 0
+    if p.line >= lineStarts.length then return text.byteLength
+    val first = lineStarts(p.line)
+    val stop = lineEnd(p.line)
+    var at = first
+    var counted = 0
+    while at < stop
+      val c = text.charAt(at)
+      val n = encoding.units(c)
+      if counted + n > p.character then return at
+      counted += n
+      at += c.toString().byteLength
+    stop
+
+  // The position of byte offset `offset`, clamped to the text; an offset inside a character, or inside
+  // a line's terminator, is placed at the character's start, or at the end of the line.
+  positionAt(offset: int, encoding: PositionEncoding = Utf16) -> Position
+    val at = max(0, min(offset, text.byteLength))
+    val line = lineOf(at)
+    val stop = min(at, lineEnd(line))
+    var i = lineStarts(line)
+    var counted = 0
+    while i < stop
+      val c = text.charAt(i)
+      val next = i + c.toString().byteLength
+      if next > stop then return Position(line, counted)
+      counted += encoding.units(c)
+      i = next
+    Position(line, counted)
+
+  // The text of `r`.
+  textIn(r: Range, encoding: PositionEncoding = Utf16) -> string
+    val (from, until) = span(r, encoding)
+    text.slice(from, until)
+
+  // The text of line `line`, without its terminator; empty past the last line.
+  lineText(line: int) -> string
+    if 0 <= line < lineStarts.length then text.slice(lineStarts(line), lineEnd(line)) else ""
+
+  // The document with `change` made to it, at `version`: the range's text replaced, or the whole text
+  // where the change has no range. A range is placed as `offsetAt` places its ends, so one reaching
+  // past the end stops there, and one whose end comes before its start replaces nothing.
+  applying(
+      change: TextDocumentContentChangeEvent,
+      version: int,
+      encoding: PositionEncoding = Utf16
+  ) -> TextDocument = change.range match
+    None -> TextDocument(uri, languageId, version, change.text)
+    Some(r) ->
+      val (from, until) = span(r, encoding)
+      TextDocument(uri, languageId, version, text.slice(0, from) + change.text + text.slice(until, text.byteLength))
+
+  // The whole document's range.
+  fullRange(encoding: PositionEncoding = Utf16) -> Range = Range(Position(0, 0), positionAt(text.byteLength, encoding))
+
+  private span(r: Range, encoding: PositionEncoding) -> (int, int)
+    val from = offsetAt(r.start, encoding)
+    (from, max(from, offsetAt(r.end, encoding)))
+
+  // Where line `line`'s text ends, before its terminator.
+  private lineEnd(line: int) -> int
+    if line + 1 >= lineStarts.length then return text.byteLength
+    val next = lineStarts(line + 1)
+    val cr = next >= 2 && int(text.byteAt(next - 2)) == int('\r')
+    if cr && int(text.byteAt(next - 1)) == int('\n') then next - 2 else next - 1
+
+  // The line holding byte offset `at`, by binary search of the line starts.
+  private lineOf(at: int) -> int
+    var lo = 0
+    var hi = lineStarts.length - 1
+    while lo < hi
+      val mid = (lo + hi + 1) / 2
+      if lineStarts(mid) <= at then lo = mid else hi = mid - 1
+    lo
+
+// The byte offset each line of `text` starts at: 0, and the offset after each `\n`, each `\r\n` and
+// each `\r` not followed by `\n`.
+private startsOf(text: string) -> Vector[int]
+  val starts = Vector.newBuilder[int]()
+  starts.addOne(0)
+  val n = text.byteLength
+  var i = 0
+  while i < n
+    val b = int(text.byteAt(i))
+    if b == int('\n')
+      starts.addOne(i + 1)
+    elif b == int('\r')
+      if i + 1 < n && int(text.byteAt(i + 1)) == int('\n') then i += 1
+      starts.addOne(i + 1)
+    i += 1
+  starts.result()
