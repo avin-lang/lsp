@@ -34,10 +34,10 @@ impl Message
   )
 
   // A response's result read as an `R`.
-  result[R: JsonDecoder]() -> Result[R, JsonError] = json.decode[ResultOf[R]](body).map(r -> r.result)
+  result[R: JsonDecoder]() -> Result[R, JsonError] = json.decode[ResultOf[R]](value).map(r -> r.result)
 
   // A notification's or a request's params read as a `P`.
-  params[P: JsonDecoder]() -> Result[P, JsonError] = json.decode[ParamsOf[P]](body).map(p -> p.params)
+  params[P: JsonDecoder]() -> Result[P, JsonError] = json.decode[ParamsOf[P]](value).map(p -> p.params)
 
 impl Display for Message
   display(out: Writer, spec: FormatSpec) = out.writeField(body, spec)

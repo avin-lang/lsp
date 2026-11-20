@@ -2,17 +2,18 @@ module dev.avinlang.lsp
 
 // A language server: the handlers a program registers, and `serve`, which reads messages, keeps the
 // lifecycle and the open documents, and answers each request on a lightweight thread of its own.
+import avin.io
 import avin.io.{ByteWriter, Reader}
 import avin.threads.{Atomic, Channel, Mutex, spawn}
 import dev.avinlang.json
 import dev.avinlang.json.{Json, JsonDecoder, JsonEncoder}
 
 // A request's handler with its params' and result's types erased: it reads its params from the
-// message's text and gives its result written as JSON.
-private data Route(run: @sendable (Context, string) -> Result[string, ResponseError])
+// message, parsed once, and gives its result written as JSON.
+private data Route(run: @sendable (Context, Json) -> Result[string, ResponseError])
 
 // A notification's handler, its params' type erased likewise.
-private data NotificationRoute(run: @sendable (Context, string) -> unit)
+private data NotificationRoute(run: @sendable (Context, Json) -> unit)
 
 // What a document's diagnostics are found by.
 private data Diagnoser(run: @sendable (Context, TextDocument) -> Vector[Diagnostic])
@@ -44,7 +45,7 @@ class Server(val name: string, val version: string = "")
       method: string,
       handler: @sendable (Context, P) -> Result[R, ResponseError]
   ) -> Server
-    routes = routes.updated(method, Route((ctx, body) -> json.decode[Params[P]](body) match
+    routes = routes.updated(method, Route((ctx, message) -> json.decode[Params[P]](message) match
       Err(e) -> Err(ResponseError(InvalidParams, e.toString()))
       Ok(p) -> handler(ctx, p.params).map(r -> json.encode(r, omitNone = true))))
     self
@@ -52,7 +53,7 @@ class Server(val name: string, val version: string = "")
   // `handler` is told of notifications of `method`, in the order they arrive, before anything after
   // them is read; params that do not read as a `P` are passed over.
   onNotification[P: JsonDecoder](method: string, handler: @sendable (Context, P) -> unit) -> Server
-    notes = notes.updated(method, NotificationRoute((ctx, body) -> json.decode[Params[P]](body) match
+    notes = notes.updated(method, NotificationRoute((ctx, message) -> json.decode[Params[P]](message) match
       Ok(p) -> handler(ctx, p.params)
       Err(_) -> ()))
     self
@@ -136,14 +137,19 @@ class Server(val name: string, val version: string = "")
     code
 
   // Connects where `args` say (`connectionOf`) and serves that connection, answering the status to
-  // exit with: as `serve` answers it, or 2 where the arguments name no connection or it cannot be
-  // made, said on standard error.
+  // exit with: as `serve` answers it, or 2 where the arguments are wrong or the connection cannot be
+  // made, said on standard error. With `--stdio`, or no connection named, the messages are the
+  // process's own standard input and output, as bytes, and standard error is the only place left for
+  // anything else: nothing but the server may write to standard output, `print` and `println`
+  // included.
   serveArgs(args: Vector[string]) -> int
     val streams = connectionOf(args) match
       Err(why) ->
         eprintln(s"lsp: $why")
         return 2
-      Ok(c) -> connect(c)
+      Ok(Stdio) -> return serve(io.stdin(), io.stdout())
+      Ok(Pipe(path)) -> connectPipe(path)
+      Ok(Socket(port)) -> connectSocket(port)
     streams match
       Err(e) ->
         eprintln(s"lsp: ${e.message}")
@@ -194,11 +200,15 @@ private class Session(
     if body.stripLeading.startsWith("[")
       send(errorText(None, ResponseError(InvalidRequest, "a batch of messages is not supported")))
       return
-    val head = json.decode[Head](body) match
+    val message = json.parse(body) match
+      Ok(tree) -> tree
+      Err(e) ->
+        send(errorText(None, ResponseError(ParseError, e.toString())))
+        return
+    val head = json.decode[Head](message) match
       Ok(h) -> h
       Err(e) ->
-        val code = if json.parse(body).isErr then ParseError else InvalidRequest
-        send(errorText(None, ResponseError(code, e.toString())))
+        send(errorText(None, ResponseError(InvalidRequest, e.toString())))
         return
     if head.jsonrpc != Some("2.0")
       send(errorText(head.id, ResponseError(InvalidRequest, "a message is JSON-RPC 2.0, with \"jsonrpc\": \"2.0\"")))
@@ -211,15 +221,15 @@ private class Session(
           send(errorText(head.id, ResponseError(InvalidRequest, "a request or a notification names a method")))
         return
     head.id match
-      None -> notified(method, body)
-      Some(id) -> requested(id, method, body)
+      None -> notified(method, message)
+      Some(id) -> requested(id, method, message)
 
-  private requested(id: RequestId, method: string, body: string)
+  private requested(id: RequestId, method: string, message: Json)
     if method == "initialize"
       if initialized
         send(errorText(Some(id), ResponseError(InvalidRequest, "'initialize' was sent already")))
         return
-      json.decode[Params[InitializeParams]](body) match
+      json.decode[Params[InitializeParams]](message) match
         Err(e) -> send(errorText(Some(id), ResponseError(InvalidParams, e.toString())))
         Ok(p) ->
           initialized = true
@@ -252,43 +262,43 @@ private class Session(
       send(errorText(Some(id), ResponseError(InvalidRequest, s"request $id is already being answered")))
       return
     inFlight.update(m -> m.updated(id, pending))
-    val token = json.decode[WithToken](body).toOption.flatMap(w -> w.params).flatMap(t -> t.workDoneToken)
+    val token = json.decode[WithToken](message).toOption.flatMap(w -> w.params).flatMap(t -> t.workDoneToken)
     val ctx = context(pending.cancelled, token)
     val table = inFlight
     val output = out
     spawn(() ->
-      val answer = route.run(ctx, body) match
+      val answer = route.run(ctx, message) match
         Ok(result) -> responseText(id, result)
         Err(error) -> errorText(Some(id), error)
       table.update(m -> m.removed(id))
       if pending.answered.compareAndSet(false, true) then output.send(Some(answer)))
 
-  private notified(method: string, body: string)
+  private notified(method: string, message: Json)
     if method == "exit"
       exitCode = Some(if shutDown then 0 else 1)
       return
     if !initialized || shutDown then return
     if method == "$/cancelRequest"
-      json.decode[Params[CancelParams]](body) match
+      json.decode[Params[CancelParams]](message) match
         Ok(p) -> cancel(p.params.id)
         Err(_) -> ()
     elif method == "textDocument/didOpen"
-      json.decode[Params[DidOpenTextDocumentParams]](body) match
+      json.decode[Params[DidOpenTextDocumentParams]](message) match
         Ok(p) ->
           val item = p.params.textDocument
           opened(TextDocument(item.uri, item.languageId, item.version, item.text))
         Err(_) -> ()
     elif method == "textDocument/didChange"
-      json.decode[Params[DidChangeTextDocumentParams]](body) match
+      json.decode[Params[DidChangeTextDocumentParams]](message) match
         Ok(p) -> changed(p.params)
         Err(_) -> ()
     elif method == "textDocument/didClose"
-      json.decode[Params[DidCloseTextDocumentParams]](body) match
+      json.decode[Params[DidCloseTextDocumentParams]](message) match
         Ok(p) -> closed(p.params.textDocument.uri)
         Err(_) -> ()
     else
       notes.get(method) match
-        Some(n) -> n.run(context(Atomic(false), None), body)
+        Some(n) -> n.run(context(Atomic(false), None), message)
         None -> ()
 
   // A cancellation: the request's handler is told, and the request is answered `RequestCancelled`

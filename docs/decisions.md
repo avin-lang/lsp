@@ -31,12 +31,14 @@ Every result and notification is encoded with `omitNone`, since the specificatio
 properties are absent rather than null. A result that is `None` as a whole, a hover with nothing to
 show, is still `null`, as the specification says.
 
-## Params are read from the message's text, twice
+## A message is parsed once, and its params decoded from the tree
 
-A message's top (`jsonrpc`, `id`, `method`) is read first, by a decoder that passes over `params`,
-and the handler's params are read from the same text by the handler's type. The method is not known
-until the top is read and may come after the params, and `json` reads typed values from text, not
-from a `Json` tree, so the text is read again rather than held as a tree and written back out.
+A message's text is parsed once into a `Json` value; text that does not parse is `ParseError`. Its
+top (`jsonrpc`, `id`, `method`) is decoded from that value, and the handler's params are decoded from
+the same value by the handler's type (`json.decode[A](Json)`, json 0.0.3), so the text is read once
+whatever the method. The params are decoded as the message's `params` member rather than from the
+member alone, so an error names the path from the message, `params.textDocument.uri`, and a message
+with no `params` is `InvalidParams` from the same decoder, as when they were read from the text.
 
 ## Each request runs on a thread of its own, and notifications run in order
 
@@ -101,17 +103,21 @@ document is still at the version it read; the check and the send happen holding 
 so a later version's diagnostics are never followed by an earlier one's. Closing a document publishes
 an empty list for it.
 
-## Connections: a pipe or a socket, and the gap at standard input
+## Connections: standard input and output, a pipe or a socket
 
 `serve(input, output)` serves any `Reader` and any sendable `ByteWriter`. `serveArgs` connects as
-editors start servers: `--pipe=<path>`, a Unix domain socket the client listens on, and
-`--socket=<port>` (or `--port`), a TCP port on the local host. **Standard input and output are not
-served**: `avin.io` reads standard input only as text, decoded with replacement characters, and a
-body's `Content-Length` counts bytes, so framing cannot be read from it exactly. This is a gap in the
-standard library, reported rather than worked around (a Sysl binding of the descriptor, as `tui`
-makes, would be the workaround). Once `avin.io` has a byte `Reader` for standard input, and a
-`ByteWriter` for standard output, `serveArgs` serves them when no connection is named and with
-`--stdio`.
+editors start servers: `--stdio`, the process's own standard input and output through `avin.io`'s
+byte streams `stdin()` and `stdout()` (Avin 0.0.35), `--pipe=<path>`, a Unix domain socket the
+client listens on, and `--socket=<port>` (or `--port`), a TCP port on the local host. With no
+connection named it serves standard input and output, since that is how most editors start a server
+and a server started by hand from a terminal is then usable at once. The last connection named
+counts, as a later option overrides an earlier one. Over standard input the server ends at the
+input's end with status 1, as for `exit` without `shutdown`: the editor has gone.
+
+The tests drive a child server over standard input and output with `cat` feeding its input from a
+FIFO the test writes, so the input is a pipe as an editor's is, and with `bash` connecting its
+output to a TCP port the test listens on, since `avin.process` gives a started command's streams
+only as files or captured text, and a `File` read fills its whole request before answering.
 
 ## The progress a request reports goes on its own token
 

@@ -1,15 +1,18 @@
 module dev.avinlang.lsp
 
-// The connections an editor starts a server on, named by the arguments it passes: `--pipe=<path>`,
-// a Unix domain socket the client listens on, and `--socket=<port>`, a TCP port on the local host
-// the client listens on. The server connects, and serves that connection until `exit`.
+// The connections an editor starts a server on, named by the arguments it passes: `--stdio`, the
+// process's own standard input and output, `--pipe=<path>`, a Unix domain socket the client listens
+// on, and `--socket=<port>`, a TCP port on the local host the client listens on. The server serves
+// that connection until `exit`, or until its input ends.
 import avin.io.IoError
 import avin.net.{StreamReader, StreamWriter, TcpStream, UnixStream}
 
-// Where to connect, from a server's arguments: `--pipe=<path>` or `--pipe <path>`, `--socket=<port>`
-// or `--socket <port>` (also spelt `--port`); `--clientProcessId` and any other argument is passed
+// Where to serve, from a server's arguments: `--stdio`, `--pipe=<path>` or `--pipe <path>`,
+// `--socket=<port>` or `--socket <port>` (also spelt `--port`); where several are given the last one
+// counts, where none is given it is `Stdio`, and `--clientProcessId` and any other argument is passed
 // over. `Err` says what is wrong.
 data Connection
+  Stdio
   Pipe(path: string)
   Socket(port: int)
 
@@ -22,7 +25,9 @@ connectionOf(args: Vector[string]) -> Result[Connection, string]
       arg.slice(0, arg.indexOf("=")),
       Some(arg.slice(arg.indexOf("=") + 1, arg.byteLength))
     ) else (arg, None)
-    if name == "--pipe" || name == "--socket" || name == "--port"
+    if arg == "--stdio"
+      found = Some(Stdio)
+    elif name == "--pipe" || name == "--socket" || name == "--port"
       val given = value match
         Some(v) -> v
         None ->
@@ -33,13 +38,12 @@ connectionOf(args: Vector[string]) -> Result[Connection, string]
         Some(port) if 0 < port < 65536 -> Some(Socket(port))
         _ -> return Err(s"'$given' is not a port")
     i += 1
-  found match
-    Some(c) -> Ok(c)
-    None -> Err(
-      "standard input and output cannot be read as bytes; start the server with --pipe=<path> or --socket=<port>"
-    )
+  Ok(found.getOrElse(Stdio))
 
-// The connection made, as its reading and writing halves.
-connect(c: Connection) -> Result[(StreamReader, StreamWriter), IoError] = c match
-  Pipe(path) -> UnixStream.connect(path).map(s -> s.split())
-  Socket(port) -> TcpStream.connect("127.0.0.1", port).map(s -> s.split())
+// The Unix domain socket at `path` connected, as its reading and writing halves.
+private connectPipe(path: string) -> Result[(StreamReader, StreamWriter), IoError] =
+  UnixStream.connect(path).map(s -> s.split())
+
+// The TCP port `port` on the local host connected, as its reading and writing halves.
+private connectSocket(port: int) -> Result[(StreamReader, StreamWriter), IoError] =
+  TcpStream.connect("127.0.0.1", port).map(s -> s.split())

@@ -109,10 +109,55 @@ tokens placed absolutely as the protocol sends them, each relative to the one be
 ## Connections
 
 `serve(input, output)` serves any `io.Reader` and `io.ByteWriter`. `serveArgs(args)` connects the way
-an editor starts a server, then serves: `--pipe=<path>` connects to the Unix domain socket the client
-listens on, and `--socket=<port>` to the TCP port on the local host. Standard input and output are not
-a connection it serves: the standard library reads standard input only as text, and a body's length
-is counted in bytes.
+an editor starts a server, then serves:
+
+- `--stdio`, or no connection named, serves the process's own standard input and output, read and
+  written as bytes. This is what most editors use. Standard output carries the messages and nothing else, so a server must not
+  `print` or `println`; its own complaints go to standard error, and `ctx.log` sends a message the
+  editor shows. The server ends when the input ends, with status 1, as after `exit` without
+  `shutdown`.
+- `--pipe=<path>` connects to the Unix domain socket the client listens on.
+- `--socket=<port>` connects to the TCP port on the local host the client listens on.
+
+Where several are given the last counts; `--clientProcessId` and any other argument is passed over.
+With a bad one (`--socket=x`, `--pipe` naming nothing) or one that cannot be made, the server says
+why on standard error and exits with status 2.
+
+The package needs Avin 0.0.35 or later, whose `io.stdin()` and `io.stdout()` read and write bytes.
+
+## Pointing an editor at a server
+
+Build the server program, whose `main` calls `serveArgs` (`avin build -o avin-lsp` in its directory;
+the name here is an example), and tell the editor to start it with `--stdio`.
+
+VS Code has no generic client of its own; an extension starts the server through the
+`vscode-languageclient` package:
+
+```ts
+import { LanguageClient, TransportKind } from "vscode-languageclient/node";
+
+const client = new LanguageClient(
+  "avin",
+  "Avin",
+  { command: "avin-lsp", args: ["--stdio"], transport: TransportKind.stdio },
+  { documentSelector: [{ scheme: "file", language: "avin" }] }
+);
+client.start();
+```
+
+Neovim (0.11 or later):
+
+```lua
+vim.lsp.config("avin", {
+  cmd = { "avin-lsp", "--stdio" },
+  filetypes = { "avin" },
+  root_markers = { "avin.hocon", ".git" },
+})
+vim.lsp.enable("avin")
+```
+
+Any other client that starts a server as a command works the same way: the command is the
+executable, and its one argument `--stdio`.
 
 ## Testing a server
 
@@ -123,4 +168,5 @@ and `params[P]()` read through the derived decoders.
 ## Tests
 
 `avin test` in this directory runs the package's tests, in `tests/`; `tests/readme.avin` holds this
-page's example, and `tests/e2e.avin` builds `examples/words` and drives it as a child process.
+page's example, and `tests/e2e.avin` builds `examples/words` and drives it as a child process over
+a socket; `tests/stdio.avin` drives it over its standard input and output.

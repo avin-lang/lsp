@@ -2,8 +2,8 @@
 // names the word under the cursor, a definition is the word's first occurrence and its references
 // all of them, completion offers the document's words, each line's first word is a symbol,
 // formatting trims trailing spaces, a rename replaces every occurrence, every word is a semantic
-// token, and each `TODO` is a warning. Started as an editor starts a server: `--pipe=<path>` or
-// `--socket=<port>`.
+// token, and each `TODO` is a warning. Started as an editor starts a server: `--stdio`,
+// `--pipe=<path>` or `--socket=<port>`.
 import dev.avinlang.lsp.{
   CompletionItem, CompletionItemKind, CompletionList, Context, Diagnostic, DiagnosticSeverity, DocumentSymbol, Hover,
   Location, MarkupContent, Position, PositionEncoding, Range, ResponseError, SemanticToken, SemanticTokensLegend,

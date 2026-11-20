@@ -1,5 +1,5 @@
-package { name = "lsp", version = "0.0.1", description = "The Language Server Protocol: JSON-RPC over Content-Length framing, the lifecycle, text documents kept in step with the editor, positions in UTF-16 or UTF-8, and typed handlers for diagnostics, hover, completion, definitions, references, symbols, formatting, rename and semantic tokens, each answered on a lightweight thread of its own", avin = "0.0.34" }
+package { name = "lsp", version = "0.0.1", description = "The Language Server Protocol: JSON-RPC over Content-Length framing, the lifecycle, text documents kept in step with the editor, positions in UTF-16 or UTF-8, and typed handlers for diagnostics, hover, completion, definitions, references, symbols, formatting, rename and semantic tokens, each answered on a lightweight thread of its own", avin = "0.0.35" }
 
 dependencies {
-  json { git = "github.com/avin-lang/json", version = "0.0.2" }
+  json { git = "github.com/avin-lang/json", version = "0.0.3" }
 }

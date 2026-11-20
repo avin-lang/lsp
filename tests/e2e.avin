@@ -147,11 +147,9 @@ overTcp()
   c.shutdown()
   assertEq(child.waitFor().ok.get, ExitStatus.Exited(0))
 
-@test("a server given no connection, or one that cannot be made, exits with status 2")
+@test("a server given a connection that cannot be made, or a bad one, exits with status 2")
 noConnection()
   for args in [
-    Vector.empty[string](),
-    ["--stdio"],
     ["--pipe=/nonexistent/socket"],
     ["--socket=notaport"],
     ["--socket=0"],

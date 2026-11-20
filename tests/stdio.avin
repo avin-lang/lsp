@@ -1,0 +1,158 @@
+module tests
+
+// The example server `examples/words` started as an editor starts most servers, `--stdio`: the
+// messages are the child's own standard input and output. Its standard input is a pipe, fed by `cat`
+// from a FIFO this test writes; its standard output is a connection back to a TCP port this test
+// listens on, so the test reads it as it arrives and sees where it ends. Its standard error is a file.
+import avin.fs
+import avin.fs.File
+import avin.io.{ByteWriter, IoError}
+import avin.net.TcpListener
+import avin.process.{Child, Command, ExitStatus}
+import avin.time.seconds
+import dev.avinlang.json.Json
+
+import dev.avinlang.lsp.{
+  Client, DidOpenTextDocumentParams, Hover, InitializeResult, Location, Position, ReferenceContext, ReferenceParams,
+  TextDocumentIdentifier, TextDocumentItem
+}
+
+// A file written through, each write handed to the platform before it returns, so the program
+// reading the FIFO sees every message as soon as it is sent.
+class WrittenThrough(private val file: File): ByteWriter
+  override write(bytes: Array[byte]) -> Result[unit, IoError]
+    file.write(bytes)?
+    file.flush()
+
+// A child server on standard input and output, and a client of it.
+class StdioServer(val client: Client, private val input: File, val child: Child, private val dir: string)
+  // Closes the client's side of the server's standard input, so the server's input ends.
+  hangUp() = _ = input.close()
+
+  // Ends the input, which `cat` waits on, waits for the server, and answers how it ended and
+  // everything it wrote to standard error. Whatever was sent before is read by the server first.
+  ended() -> (ExitStatus, string)
+    _ = input.close()
+    val status = child.waitFor().ok.get
+    val errors = fs.readText(dir + "/err").ok.get
+    _ = fs.removeDirAll(dir)
+    (status, errors)
+
+  // Whether the server's standard output has ended with nothing on it but whole messages: the
+  // notifications the client held or had not yet read are each a `publishDiagnostics`.
+  outputEndedClean() -> bool
+    loop
+      val m = client.receive() match
+        Some(m) -> m
+        None -> return true
+      if m.method != Some("textDocument/publishDiagnostics") then return false
+
+// The example server started with `args`, `--stdio` unless others are given.
+stdio(args: Vector[string] = ["--stdio"]) -> StdioServer
+  val dir = fs.createTempDir("lsp-stdio-").ok.get
+  val fifo = dir + "/in"
+  assertEq(Command("mkfifo", fifo).run().ok.get, ExitStatus.Exited(0))
+  // Opened for reading and writing, which never waits for the other end, so `cat` finds a writer
+  // there when it opens the FIFO, and sees its end once this handle is closed.
+  val input = fs.openUpdate(fifo).ok.get
+  val listener = TcpListener.bind("127.0.0.1", 0).ok.get
+  // `bash` connects its descriptor 3 to the port and starts the server with that as its standard
+  // output: `$0` is the server, `$1` the port, and the rest the server's arguments.
+  val script = "exec 3<>\"/dev/tcp/127.0.0.1/$1\" && shift && exec \"$0\" \"$@\" >&3"
+  val server = Command("bash", (["-c", script, wordsServer, s"${listener.port()}"] ++ args)*)
+  val child = (Command("cat", fifo) | server).errorsToFile(dir + "/err").start().ok.get
+  val conn = listener.accept().ok.get
+  conn.setTimeout(seconds(20)).ok.get
+  val (output, _) = conn.split()
+  StdioServer(Client(output, WrittenThrough(input)), input, child, dir)
+
+stdioDoc() -> TextDocumentIdentifier = TextDocumentIdentifier(uri)
+
+@test("over standard input and output: initialize, didOpen, hover, shutdown and exit")
+stdioSession()
+  val s = stdio()
+  val c = s.client
+  val init = c.initialize().get.result[InitializeResult]().ok.get
+  assertEq(init.serverInfo.name, "words")
+  c.notify("textDocument/didOpen", DidOpenTextDocumentParams(TextDocumentItem(uri, "words", 1, "alpha TODO\nbeta")))
+  val hover = c.call("textDocument/hover", at(uri, 1, 2)).get.result[Hover]().ok.get
+  assertEq(hover.contents.value, "the word beta")
+  assertEq(c.shutdown().get.value.get("result"), Some(Json.Null))
+  assertEq(s.ended(), (ExitStatus.Exited(0), ""))
+  assert(s.outputEndedClean())
+
+@test("a server named no connection serves standard input and output, other arguments passed over")
+stdioByDefault()
+  for args in [Vector.empty[string](), ["--clientProcessId=1"], ["--pipe=/nowhere", "--stdio"]]
+    val s = stdio(args)
+    val c = s.client
+    assertEq(c.initialize().get.result[InitializeResult]().ok.get.serverInfo.name, "words")
+    c.shutdown()
+    assertEq(s.ended(), (ExitStatus.Exited(0), ""))
+    assert(s.outputEndedClean())
+
+@test("over standard input and output, the input ending without shutdown ends the server with status 1")
+stdioInputEnds()
+  val s = stdio()
+  s.client.initialize().get
+  s.hangUp()
+  assertEq(s.ended(), (ExitStatus.Exited(1), ""))
+  assert(s.outputEndedClean())
+
+@test("over standard input and output, exit without shutdown ends the server with status 1")
+stdioExitWithoutShutdown()
+  val s = stdio()
+  s.client.initialize().get
+  s.client.notify("exit", Json.Null)
+  assertEq(s.ended(), (ExitStatus.Exited(1), ""))
+  assert(s.outputEndedClean())
+
+@test("over standard input and output, the input ending inside a message ends the server with status 1")
+stdioTruncated()
+  val s = stdio()
+  s.client.initialize().get
+  s.client.sendBytes("Content-Length: 50\r\n\r\n{\"jsonrpc\"".utf8)
+  s.hangUp()
+  val (status, errors) = s.ended()
+  assertEq(status, ExitStatus.Exited(1))
+  assertEq(errors, "lsp: the input ended inside a message\n")
+  assert(s.outputEndedClean())
+
+@test("over standard input and output, a malformed header ends the server with status 1, said on standard error")
+stdioMalformedHeader()
+  for (bad, said) in [
+    ("Content-Length: x\r\n\r\n{}", "lsp: 'x' is not a Content-Length\n"),
+    ("Content-Type: text\r\n\r\n{}", "lsp: a message with no Content-Length header\n"),
+    ("no colon here\r\n\r\n{}", "lsp: 'no colon here' is not a header\n")
+  ]
+    val s = stdio()
+    s.client.initialize().get
+    s.client.sendBytes(bad.utf8)
+    val (status, errors) = s.ended()
+    assertEq(status, ExitStatus.Exited(1))
+    assertEq(errors, said)
+    assert(s.outputEndedClean())
+
+@test("over standard input and output, messages far larger than one read, both ways")
+stdioLarge()
+  val s = stdio()
+  val c = s.client
+  c.initialize().get
+  val lines = 10000
+  val text = (0 ..< lines).map(i -> "alpha beta").mkString("\n")
+  assert(text.byteLength > 65536)
+  c.notify("textDocument/didOpen", DidOpenTextDocumentParams(TextDocumentItem(uri, "words", 1, text)))
+  val hover = c.call("textDocument/hover", at(uri, lines - 1, 7)).get.result[Hover]().ok.get
+  assertEq(hover.contents.value, "the word beta")
+  assertEq(hover.range, Some(span(lines - 1, 6, lines - 1, 10)))
+  val answer = c.call(
+    "textDocument/references",
+    ReferenceParams(stdioDoc(), Position(0, 1), ReferenceContext(true))
+  ).get
+  assert(answer.body.byteLength > 65536 * 8)
+  val refs = answer.result[Vector[Location]]().ok.get
+  assertEq(refs.length, lines)
+  assertEq(refs(lines - 1).range, span(lines - 1, 0, lines - 1, 5))
+  c.shutdown()
+  assertEq(s.ended(), (ExitStatus.Exited(0), ""))
+  assert(s.outputEndedClean())
